@@ -20,35 +20,49 @@ class Navigator:
         self.page = page
         self.config = config
         self.query_interval = config.get("request", {}).get("query_interval", 3)
+        # 状态追踪：避免重复点击已展开的折叠菜单（再次点击会收起）
+        self._info_disclosure_expanded = False
+        self._current_category: Optional[str] = None
 
     def navigate_to_info_disclosure(self):
         """
-        导航到 信息披露 菜单
-        点击左侧栏中的「信息披露」展开菜单
+        展开左侧栏「信息披露」父菜单
+
+        信息披露是所有数据页面的顶层入口，必须先展开才能看到子分类。
+        使用状态追踪避免重复点击导致菜单收起。
         """
-        logger.info("正在导航到「信息披露」...")
+        if self._info_disclosure_expanded:
+            logger.debug("「信息披露」已展开，跳过点击")
+            return
+        logger.info("正在展开「信息披露」菜单...")
         try:
-            # 查找并点击「信息披露」菜单项
             menu_item = self.page.locator("text=信息披露").first
             menu_item.click()
             time.sleep(1)
-            logger.info("已点击「信息披露」")
+            self._info_disclosure_expanded = True
+            logger.info("已展开「信息披露」")
         except PlaywrightTimeout:
             logger.warning("未找到「信息披露」菜单，尝试直接导航")
 
     def navigate_to_category(self, category: str):
         """
-        导航到一级分类菜单（如：现货出清结果、现货实时数据、现货日前信息、综合查询）
+        展开二级分类菜单（如：现货出清结果、现货实时数据、现货日前信息、综合查询）
+
+        这些分类是「信息披露」的子菜单，需先展开「信息披露」。
+        使用状态追踪避免重复点击导致菜单收起。
 
         Args:
             category: 分类名称
         """
-        logger.info("正在导航到分类「%s」...", category)
+        if self._current_category == category:
+            logger.debug("分类「%s」已展开，跳过点击", category)
+            return
+        logger.info("正在展开分类「%s」...", category)
         try:
-            # 点击左侧栏中的一级分类
             menu_item = self.page.locator(f"text={category}").first
             menu_item.click()
             time.sleep(1)
+            self._current_category = category
             logger.info("已展开「%s」", category)
         except PlaywrightTimeout:
             logger.error("未找到分类「%s」菜单", category)
@@ -78,19 +92,26 @@ class Navigator:
         """
         完整导航到目标页面
 
+        实际导航路径（3层）：信息披露 > 分类 > 页面
+        例如：信息披露 > 现货出清结果 > 日前备用总量
+
         Args:
-            category: 一级分类（现货出清结果/现货实时数据/现货日前信息/综合查询）
+            category: 二级分类（现货出清结果/现货实时数据/现货日前信息/综合查询）
             page_name: 页面名称
             subcategory_path: 额外的子分类路径（如 综合查询 下的 供需与约束 > 参数信息）
         """
         logger.info("=" * 60)
-        logger.info("导航到: %s > %s", category, page_name)
+        logger.info("导航到: 信息披露 > %s > %s", category, page_name)
 
-        # 先点击一级分类
+        # 第一步：展开「信息披露」父菜单（所有数据页面的顶层入口）
+        self.navigate_to_info_disclosure()
+
+        # 第二步：展开二级分类
         self.navigate_to_category(category)
 
+        # 第三步：点击具体页面
         if subcategory_path:
-            # 综合查询的特殊导航路径
+            # 综合查询的特殊导航路径（多层展开）
             self._navigate_comprehensive_query(page_name, subcategory_path)
         else:
             # 普通导航：直接点击子菜单
@@ -102,20 +123,14 @@ class Navigator:
         """
         处理综合查询的特殊导航
 
-        综合查询的结构：综合查询 > 供需与约束 > 参数信息 > 节点分配因子
-        需要依次展开中间层级
+        完整路径：信息披露 > 综合查询 > 供需与约束 > 参数信息 > 节点分配因子
+        注意：「信息披露」和「综合查询」已由 navigate_to_page 中的
+        navigate_to_info_disclosure() 和 navigate_to_category() 展开，
+        此处只需处理中间层级和最终目标页面。
         """
         logger.info("综合查询特殊导航: %s > %s", subcategory_path, page_name)
 
-        # 先点击「综合查询」
-        try:
-            comp_query = self.page.locator("text=综合查询").first
-            comp_query.click()
-            time.sleep(1)
-        except PlaywrightTimeout:
-            pass
-
-        # 解析路径中的中间层级
+        # 解析路径中的中间层级（不再重复点击「综合查询」）
         parts = [p.strip() for p in subcategory_path.split(">")]
         for part in parts:
             try:
