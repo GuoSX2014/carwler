@@ -128,6 +128,9 @@ def run_crawler(config: dict, tasks: dict, start_date: str, end_date: str):
         # 创建页面爬取器
         page_crawler = PageCrawler(browser.page, config)
 
+        # 等待侧边栏菜单渲染完成（Vue 动态加载，首次需要额外等待）
+        page_crawler.navigator.wait_for_sidebar_ready()
+
         # 逐任务执行
         for task_name, task_config in tasks.items():
             try:
