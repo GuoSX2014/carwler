@@ -35,6 +35,11 @@ class BrowserManager:
         """启动浏览器并返回页面实例"""
         os.makedirs(self.download_dir, exist_ok=True)
 
+        # 无图形环境（如 SSH 无 DISPLAY）时强制使用无头模式，避免 TargetClosedError
+        if not self.headless and not os.environ.get("DISPLAY"):
+            self.headless = True
+            logger.info("检测到无 DISPLAY 环境，已自动切换为无头模式 (headless=True)")
+
         logger.info("正在启动 Chromium 浏览器 (headless=%s)...", self.headless)
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(
