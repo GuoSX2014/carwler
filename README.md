@@ -23,7 +23,8 @@
 
 ## 功能概述
 
-- **自动化浏览器操作**：基于 Playwright + Chromium，完整模拟用户操作
+- **连接已有浏览器**：通过 CDP 连接到已登录的 Chrome，无需重复登录
+- **自动化浏览器操作**：基于 Playwright + Chrome，完整模拟用户操作
 - **多页面数据爬取**：支持 18 种数据类别的自动化爬取
 - **智能导出**：优先使用页面"导出"功能，回退到 HTML 表格解析
 - **日期迭代**：支持按日逐日爬取指定日期范围的数据
@@ -79,7 +80,8 @@
 - **Python**：3.9 及以上
 - **操作系统**：Windows / macOS / Linux
 - **网络**：需能访问 `https://pmos.sx.sgcc.com.cn`
-- **浏览器**：Playwright 会自动下载 Chromium
+- **Chrome 浏览器**：需已安装 Google Chrome（用于 CDP 连接模式）
+- **Playwright**：Python 包（`pip install playwright`），用于浏览器自动化
 
 ---
 
@@ -119,10 +121,41 @@ playwright install chromium
 ```
 
 > 首次安装 Playwright 浏览器可能需要几分钟时间，也会自动下载所需系统依赖。
+> 如果使用 CDP 连接模式（默认），Playwright 不会启动新浏览器，但仍需安装以提供运行时依赖。
 
 ---
 
 ## 快速开始
+
+### 前置步骤：启动 Chrome（CDP 连接模式）
+
+脚本默认通过 **Chrome DevTools Protocol (CDP)** 连接到已打开且已登录的 Chrome 浏览器，而非启动新浏览器。使用前需：
+
+**1. 以远程调试模式启动 Chrome：**
+
+```bash
+# Linux 服务器
+google-chrome --remote-debugging-port=9222
+
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+# Windows
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+**2. 在 Chrome 中手动完成操作：**
+- 打开 `https://pmos.sx.sgcc.com.cn`
+- 完成登录认证
+- 确认已进入系统首页（能看到左侧菜单栏）
+
+**3. 保持 Chrome 运行，然后执行爬虫脚本。**
+
+> **重要提示：**
+> - Chrome 必须带 `--remote-debugging-port=9222` 参数启动，否则脚本无法连接
+> - 如果 Chrome 已在运行但没带该参数，需关闭后重新启动
+> - 脚本结束后只断开连接，**不会关闭 Chrome 和已打开的页面**
+> - CDP 端口号可在 `config.yaml` 的 `browser.cdp_url` 中修改
 
 ### 1. 查看可用任务
 
@@ -167,7 +200,7 @@ python main.py --start 2025-06-01 --end 2025-06-30
 ### 5. 组合使用
 
 ```bash
-python main.py --task 实时节点边际电价 --start 2025-06-01 --end 2025-06-07
+python main.py --task 实时节点边际电价 --start 2025-06-01 --end 2025-06-03
 ```
 
 ### 6. 数据质量校验
@@ -206,11 +239,24 @@ python main.py --schedule
 
 ```yaml
 browser:
-  headless: false        # 是否无头模式（调试时设为 false 可看到浏览器操作）
-  slow_mo: 300           # 操作间隔（毫秒），避免过快被检测
+  # 连接模式: "connect"(连接已有Chrome) / "launch"(启动新浏览器)
+  mode: "connect"
+  cdp_url: "http://localhost:9222"  # CDP 连接地址
+  target_url_pattern: "pmos.sx.sgcc.com.cn"  # 匹配目标标签页的 URL 关键词
+  headless: false        # 仅 launch 模式：是否无头模式
+  slow_mo: 300           # 仅 launch 模式：操作间隔（毫秒）
   timeout: 30000         # 全局超时（毫秒）
   download_dir: "./data/exports"  # 导出文件下载目录
 ```
+
+| 配置项 | 说明 | 默认值 |
+|-------|------|--------|
+| `mode` | `"connect"`: 通过 CDP 连接已有 Chrome；`"launch"`: 启动新 Chromium | `"connect"` |
+| `cdp_url` | Chrome 远程调试地址 | `"http://localhost:9222"` |
+| `target_url_pattern` | 用于查找目标标签页的 URL 关键词 | `"pmos.sx.sgcc.com.cn"` |
+| `headless` | 仅 launch 模式生效，是否无头运行 | `false` |
+| `slow_mo` | 仅 launch 模式生效，操作间隔（毫秒） | `300` |
+| `timeout` | 全局超时（毫秒） | `30000` |
 
 ### 日期范围
 
@@ -319,12 +365,16 @@ crawler/
 ## 模块说明
 
 ### `crawler/browser.py` - 浏览器管理
-- 基于 Playwright 管理 Chromium 浏览器实例
-- 支持 headless/headed 模式切换
+- 支持两种工作模式：
+  - **connect 模式**（默认）：通过 CDP 连接到已打开且已登录的 Chrome，脚本结束只断开连接
+  - **launch 模式**：启动全新 Chromium 实例，支持 headless/headed 切换
+- 自动查找包含目标 URL 的标签页
 - 上下文管理器（with 语句）自动管理生命周期
 
 ### `crawler/navigator.py` - 页面导航
-- 处理左侧栏一级/二级菜单的展开和点击
+- 侧边栏使用 **el-tree（树形控件）** 而非 el-menu，通过 `span[title="..."]` 属性精确匹配菜单项
+- 点击 `.el-tree-node__content` 触发展开，检查 `aria-expanded` 属性避免误触 toggle
+- 导航失败时自动保存诊断截图到 `./logs/`
 - 支持内容区 Tab 切换
 - 特殊处理综合查询的多级菜单导航
 
@@ -375,7 +425,35 @@ crawler/
 
 ## 常见问题
 
-### Q: 浏览器启动失败？
+### Q: 无法连接到 Chrome？
+
+**错误信息：** `无法连接到 Chrome，请确认...`
+
+检查以下几点：
+1. Chrome 是否已启动，且带 `--remote-debugging-port=9222` 参数
+2. 如果 Chrome 已在运行但没带该参数，需**完全关闭**后重新启动
+3. `config.yaml` 中 `cdp_url` 地址是否正确
+4. 确认端口未被防火墙阻挡
+
+```bash
+# 验证 CDP 是否可用
+curl http://localhost:9222/json/version
+```
+
+### Q: 连接成功但找不到目标标签页？
+
+**错误信息：** `未找到包含「pmos.sx.sgcc.com.cn」的标签页`
+
+- 确认 Chrome 中已打开 `https://pmos.sx.sgcc.com.cn` 并完成登录
+- 检查 `config.yaml` 中 `target_url_pattern` 是否与实际 URL 匹配
+
+### Q: 侧边栏菜单展开失败？
+
+导航失败时会自动保存诊断截图到 `./logs/debug_*.png`，检查截图可快速定位问题：
+- 如果截图显示**登录页面** → Chrome 未登录或连接到了错误的标签页
+- 如果截图显示**首页但菜单未展开** → 可能是选择器或等待时间问题
+
+### Q: 浏览器启动失败（launch 模式）？
 确保已执行 `playwright install chromium` 安装浏览器。如果在 Linux 服务器上运行，可能需要安装系统依赖：
 ```bash
 playwright install-deps chromium
@@ -399,21 +477,24 @@ python main.py --start 2025-06-15 --end 2025-06-15
 爬虫内置增量更新机制。如果某日数据的 CSV 文件已存在，会自动跳过。直接重新运行即可从中断处继续。
 
 ### Q: 如何调试特定页面？
-1. 将 `config.yaml` 中 `browser.headless` 设为 `false`
-2. 将 `logging.level` 设为 `DEBUG`
-3. 使用 `--task` 参数只运行目标任务
+1. 将 `logging.level` 设为 `DEBUG`
+2. 使用 `--task` 参数只运行目标任务
+3. 检查 `./logs/debug_*.png` 诊断截图
 
 ---
 
 ## 注意事项
 
-1. **合规使用**：请遵守目标网站的 robots.txt 和使用条款，合理控制爬取频率
-2. **反爬策略**：脚本已内置合理的请求间隔，请勿将间隔调得过低
-3. **网络环境**：需确保运行环境能正常访问山西电力交易平台
-4. **登录状态**：目标页面（信息披露）通常为公开数据，如需登录请手动登录后再运行
-5. **选择器适配**：如果网站前端改版，CSS 选择器可能需要更新
-6. **数据准确性**：建议定期使用 `--validate` 进行数据质量检查
-7. **存储空间**：长期大量爬取需注意磁盘空间，单日全量数据约 10-50MB
+1. **Chrome 启动方式**：必须使用 `--remote-debugging-port=9222` 参数启动 Chrome，否则脚本无法连接。已在运行的 Chrome（无该参数）需关闭后重新启动
+2. **登录状态**：脚本不处理登录流程，需在 Chrome 中手动完成登录并进入系统首页后再运行脚本
+3. **脚本不关闭浏览器**：connect 模式下脚本结束只断开 CDP 连接，Chrome 和所有标签页保持不变
+4. **侧边栏结构**：左侧导航栏使用 Element UI 的 **el-tree（树形控件）**，菜单项通过 `span[title="..."]` 属性定位，如果网站前端改版，选择器可能需要更新
+5. **诊断截图**：导航失败时会自动保存截图到 `./logs/debug_*.png`，便于远程调试
+6. **合规使用**：请遵守目标网站的 robots.txt 和使用条款，合理控制爬取频率
+7. **反爬策略**：脚本已内置合理的请求间隔，请勿将间隔调得过低
+8. **网络环境**：需确保运行环境能正常访问山西电力交易平台
+9. **数据准确性**：建议定期使用 `--validate` 进行数据质量检查
+10. **存储空间**：长期大量爬取需注意磁盘空间，单日全量数据约 10-50MB
 
 ---
 

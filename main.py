@@ -121,9 +121,15 @@ def run_crawler(config: dict, tasks: dict, start_date: str, end_date: str):
     logger.info("=" * 70)
 
     with BrowserManager(config) as browser:
-        # 导航到目标网站
-        browser.navigate(target_url)
-        time.sleep(3)
+        mode = config.get("browser", {}).get("mode", "connect")
+
+        if mode == "connect":
+            # connect 模式：Chrome 已打开且已登录，直接操作现有页面
+            logger.info("已连接到现有页面: %s", browser.page.url)
+        else:
+            # launch 模式：启动新浏览器，需导航到目标网站
+            browser.navigate(target_url)
+            time.sleep(3)
 
         # 创建页面爬取器
         page_crawler = PageCrawler(browser.page, config)
