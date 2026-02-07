@@ -31,22 +31,45 @@ class FilterHandler:
         """
         等待筛选区域渲染完成。
 
+        不同页面可能使用不同的前端框架：
+        - Element UI 页面：使用 .el-form-item, .el-date-editor 等类
+        - 其他页面（如抽蓄电站水位）：使用标准 HTML input, button 等
+
         处理两种异常：
         - PlaywrightTimeout: 超时但 Frame 仍有效，可以继续尝试
         - 其他异常（如 Frame was detached）: Frame 失效，需要抛出让上层重试
         """
         try:
+            # 先尝试 Element UI 选择器
             self.ctx.wait_for_selector(
                 ".el-form-item, .el-date-editor, .el-select, .el-input",
-                timeout=20000,
+                timeout=10000,
             )
+            return
         except PlaywrightTimeout:
-            logger.warning("筛选区域未在预期时间出现")
+            pass
         except Exception as e:
             err_msg = str(e)
             if "detached" in err_msg.lower():
                 logger.error("iframe 已 detached，需要重新检测: %s", err_msg)
-                raise  # 向上层抛出，触发 _ensure_content_frame 重新检测
+                raise
+            logger.warning("等待筛选区域时出现异常: %s", e)
+            return
+
+        # Element UI 选择器未匹配，尝试通用选择器（适配非 Element UI 页面）
+        try:
+            self.ctx.wait_for_selector(
+                "input, select, button, form, table",
+                timeout=10000,
+            )
+            logger.debug("通过通用选择器检测到筛选区域")
+        except PlaywrightTimeout:
+            logger.warning("筛选区域未在预期时间出现（Element UI 和通用选择器均未匹配）")
+        except Exception as e:
+            err_msg = str(e)
+            if "detached" in err_msg.lower():
+                logger.error("iframe 已 detached，需要重新检测: %s", err_msg)
+                raise
             logger.warning("等待筛选区域时出现异常: %s", e)
 
     def _find_form_item(self, label: str):
@@ -97,8 +120,12 @@ class FilterHandler:
         """
         设置日期输入框（格式：YYYY-MM-DD）
 
-        通过清空并重新输入日期值，适配 Element UI DatePicker。
-        需要先点击日期输入框打开日期面板，然后修改值并关闭面板。
+        适配多种页面类型：
+        - Element UI DatePicker 页面（如：实时节点边际电价等）
+        - 普通文本输入框页面（如：抽蓄电站水位等）
+
+        通过多种策略查找日期输入框，优先尝试 Element UI 选择器，
+        回退到通用选择器。
 
         Args:
             date_str: 目标日期（YYYY-MM-DD）
@@ -109,7 +136,7 @@ class FilterHandler:
 
             date_input = None
 
-            # 策略1：通过"日期"标签定位其旁边的日期输入框
+            # 策略1：通过"日期"标签定位其旁边的日期输入框（Element UI）
             form_item = self._find_form_item("日期")
             if form_item is not None:
                 date_input = self._pick_visible_input(
@@ -120,10 +147,11 @@ class FilterHandler:
                         'input[placeholder*="日期"]',
                         'input[placeholder*="date"]',
                         ".el-input__inner",
+                        "input",
                     ],
                 )
 
-            # 策略2：全局查找日期控件
+            # 策略2：全局查找 Element UI 日期控件
             if date_input is None:
                 date_input = self._pick_visible_input(
                     self.ctx,
@@ -136,10 +164,55 @@ class FilterHandler:
                     ],
                 )
 
+            # 策略3：通过标签文本查找附近的 input（适配非 Element UI 页面）
+            if date_input is None:
+                for label_text in ["日期", "运行日期", "查询日期", "选择日期", "日"]:
+                    try:
+                        label_el = self.ctx.locator(f"text={label_text}").first
+                        if label_el and label_el.is_visible():
+                            # 向上遍历父级，查找附近的 input
+                            for level in range(1, 6):
+                                ancestor = label_el
+                                for _ in range(level):
+                                    ancestor = ancestor.locator("..")
+                                try:
+                                    inp = ancestor.locator("input").first
+                                    if inp and inp.is_visible():
+                                        date_input = inp
+                                        logger.debug(
+                                            "通过标签「%s」+ 父级(level=%d)找到日期输入框",
+                                            label_text, level,
+                                        )
+                                        break
+                                except Exception:
+                                    continue
+                            if date_input is not None:
+                                break
+                    except Exception:
+                        continue
+
+            # 策略4：查找值包含日期格式的 input（当前页面已有日期值）
+            if date_input is None:
+                try:
+                    inputs = self.ctx.locator("input").all()
+                    for inp in inputs:
+                        try:
+                            if inp.is_visible():
+                                val = inp.input_value().strip()
+                                # 检查值是否类似日期格式 YYYY-MM-DD
+                                if val and len(val) == 10 and val[4] == "-" and val[7] == "-":
+                                    date_input = inp
+                                    logger.debug("通过已有日期值找到日期输入框: %s", val)
+                                    break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
             if date_input is None:
                 raise RuntimeError("未找到日期输入框")
 
-            # 点击日期输入框，打开日期面板
+            # 点击日期输入框
             date_input.click()
             time.sleep(0.5)
 

@@ -46,6 +46,9 @@ class PageCrawler:
         self.retry_times = config.get("request", {}).get("retry_times", 3)
         self.retry_interval = config.get("request", {}).get("retry_interval", 5)
 
+        # 记住当前任务使用的 iframe ID，用于重新检测时优先匹配
+        self._current_iframe_id: Optional[str] = None
+
     # ── iframe 上下文切换 ────────────────────────────────────────
 
     def _get_content_frame(self) -> Optional[Frame]:
@@ -61,9 +64,31 @@ class PageCrawler:
         - 多个 iframe 共存，只有当前激活的 tab 对应的 iframe 可见
         - iframe id 类似 pxf-phbsx-other-outer, pxf-common-portal 等
 
+        优先策略：
+        - 如果记录了上次使用的 iframe ID，优先查找该 ID 的 iframe
+        - 避免在重新检测时误切换到其他页面的 iframe
+
         Returns:
             可见 iframe 的 Frame 对象，未找到返回 None
         """
+        # 方法0：如果记录了 iframe ID，优先按 ID 查找
+        if self._current_iframe_id:
+            try:
+                target = self.page.query_selector(
+                    f'iframe#{self._current_iframe_id}'
+                )
+                if target and target.is_visible():
+                    frame = target.content_frame()
+                    if frame:
+                        logger.info(
+                            "通过已记录ID找到内容区 iframe: %s (URL: %s)",
+                            self._current_iframe_id,
+                            frame.url[:80] if frame.url else "N/A",
+                        )
+                        return frame
+            except Exception as e:
+                logger.debug("通过ID查找iframe失败: %s", e)
+
         # 方法1：通过 query_selector 找到可见的 iframe 元素
         try:
             iframes = self.page.query_selector_all("iframe")
@@ -72,11 +97,14 @@ class PageCrawler:
                     if iframe_el.is_visible():
                         frame = iframe_el.content_frame()
                         if frame:
+                            iframe_id = iframe_el.get_attribute("id") or "unknown"
                             logger.info(
                                 "找到内容区 iframe: %s (URL: %s)",
-                                iframe_el.get_attribute("id") or "unknown",
+                                iframe_id,
                                 frame.url[:80] if frame.url else "N/A",
                             )
+                            # 记住这个 iframe 的 ID
+                            self._current_iframe_id = iframe_id
                             return frame
                 except Exception:
                     continue
@@ -226,6 +254,9 @@ class PageCrawler:
         except Exception as e:
             logger.error("导航到「%s」失败: %s", task_name, e)
             return
+
+        # ★ 重置 iframe ID 记录（新任务可能使用不同的 iframe）
+        self._current_iframe_id = None
 
         # ★ 关键步骤：导航完成后，检测 iframe 并切换上下文
         self._switch_to_content_frame()
