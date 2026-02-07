@@ -32,7 +32,7 @@ class FilterHandler:
         try:
             self.ctx.wait_for_selector(
                 ".el-form-item, .el-date-editor, .el-select, .el-input",
-                timeout=10000,
+                timeout=20000,
             )
         except PlaywrightTimeout:
             logger.warning("筛选区域未在预期时间出现")
@@ -180,6 +180,29 @@ class FilterHandler:
             logger.error("设置日期失败 [%s]: %s", date_str, e)
             raise
 
+    def _find_active_dropdown_panel(self):
+        """
+        找到当前打开的（可见的）el-select 下拉面板。
+
+        Element UI 的下拉面板 .el-select-dropdown.el-popper 挂载在 body 上，
+        页面上可能存在多个面板（如节点名称下拉、分页条数下拉等），
+        但同一时刻只有一个是可见的（正在展开的那个）。
+
+        Returns:
+            可见的下拉面板 Locator，未找到返回 None
+        """
+        try:
+            panels = self.ctx.locator(".el-select-dropdown.el-popper").all()
+            for panel in panels:
+                try:
+                    if panel.is_visible():
+                        return panel
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
     def _open_dropdown_panel(self, dropdown_label: str):
         """
         打开指定标签的下拉框面板，并等待面板出现。
@@ -204,34 +227,69 @@ class FilterHandler:
         # 先关闭可能已打开的面板
         try:
             self.page.keyboard.press("Escape")
-            time.sleep(0.3)
+            time.sleep(0.5)
         except Exception:
             pass
+
+        # 确保所有面板都已关闭
+        for _ in range(5):
+            if self._find_active_dropdown_panel() is None:
+                break
+            time.sleep(0.3)
 
         # 点击打开下拉面板
         dropdown.click()
         time.sleep(0.8)
 
-        # 等待下拉面板出现（el-select-dropdown 是挂载在 body 上的独立 DOM）
-        try:
-            self.ctx.wait_for_selector(
-                ".el-select-dropdown__item",
-                state="visible",
-                timeout=5000,
-            )
-        except PlaywrightTimeout:
-            # 可能首次点击未生效，再试一次
-            logger.debug("下拉面板未出现，重试点击...")
-            dropdown.click()
-            time.sleep(1)
+        # 等待目标下拉面板出现（通过检测可见面板）
+        panel = None
+        for attempt in range(3):
+            # 检查是否有面板变为可见
+            panel = self._find_active_dropdown_panel()
+            if panel:
+                # 确认面板中有选项
+                try:
+                    item_count = panel.locator(".el-select-dropdown__item").count()
+                    if item_count > 0:
+                        logger.debug("下拉面板已出现，包含 %d 个选项", item_count)
+                        break
+                except Exception:
+                    pass
+
+            if attempt < 2:
+                # 重试：再次点击下拉框
+                logger.debug("下拉面板未出现，重试点击... (第%d次)", attempt + 2)
+                try:
+                    # 先关闭可能打开的其他面板
+                    self.page.keyboard.press("Escape")
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                dropdown.click()
+                time.sleep(1.5)
+
+        if panel is None or not panel.is_visible():
+            logger.warning("下拉面板仍未出现，尝试使用 JavaScript 触发")
+            # 最后手段：通过 JS 点击 el-select 容器触发展开
             try:
-                self.ctx.wait_for_selector(
-                    ".el-select-dropdown__item",
-                    state="visible",
-                    timeout=5000,
-                )
-            except PlaywrightTimeout:
-                logger.warning("下拉面板仍未出现")
+                self.ctx.evaluate("""(inputEl) => {
+                    const selectEl = inputEl.closest('.el-select');
+                    if (selectEl) {
+                        const input = selectEl.querySelector('.el-input__inner');
+                        if (input) {
+                            input.click();
+                            input.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                            input.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                        }
+                    }
+                }""", dropdown.element_handle())
+                time.sleep(1.5)
+                panel = self._find_active_dropdown_panel()
+            except Exception as e:
+                logger.debug("JS 触发下拉面板失败: %s", e)
+
+        if panel is None:
+            logger.warning("下拉面板最终未能打开")
 
         return dropdown
 
@@ -247,6 +305,9 @@ class FilterHandler:
         """
         从当前打开的下拉面板中收集所有选项文本。
 
+        关键：页面上可能存在多个下拉面板（如节点名称、分页条数等），
+        必须只从当前打开（可见）的面板中收集选项，避免混入其他面板的内容。
+
         Element UI 的 el-select 下拉面板可能包含可滚动列表，
         但所有选项 DOM 节点都存在（非虚拟滚动），可以一次性获取。
 
@@ -255,12 +316,23 @@ class FilterHandler:
         """
         options = []
         try:
-            items = self.ctx.locator(
-                ".el-select-dropdown__item span, .el-select-dropdown__item"
-            ).all()
+            # 关键修复：仅从当前打开的可见面板中收集选项
+            panel = self._find_active_dropdown_panel()
+            if panel is None:
+                logger.warning("未找到可见的下拉面板，无法收集选项")
+                return options
+
+            # 优先取 span 内文本（更精确），回退到 li 自身文本
+            items = panel.locator(".el-select-dropdown__item").all()
             for item in items:
                 try:
-                    text = item.text_content().strip()
+                    # 优先读 span 子元素的文本
+                    span = item.locator("span").first
+                    text = ""
+                    try:
+                        text = span.text_content().strip()
+                    except Exception:
+                        text = item.text_content().strip()
                     if text and text != "全部" and text not in options:
                         options.append(text)
                 except Exception:
@@ -312,10 +384,12 @@ class FilterHandler:
 
         流程：
         1. 打开下拉面板
-        2. 在面板中找到目标选项
+        2. 在当前可见面板中找到目标选项
         3. 滚动到可见区域并点击
         4. 等待面板关闭
         5. 验证选择结果
+
+        关键：必须只在当前打开的面板中查找，避免误点击其他面板的选项。
 
         Args:
             dropdown_label: 下拉框标签
@@ -329,12 +403,20 @@ class FilterHandler:
             self._open_dropdown_panel(dropdown_label)
             time.sleep(0.3)
 
+            # 关键：找到当前打开的面板，仅在其中查找选项
+            panel = self._find_active_dropdown_panel()
+            if panel is None:
+                self._close_dropdown_panel()
+                raise RuntimeError(
+                    f"下拉面板未打开，无法选择选项: {option_text}"
+                )
+
             # 在面板中查找目标选项并点击
             option_found = False
 
-            # 策略1：精确匹配 el-select-dropdown__item
+            # 策略1：精确匹配 el-select-dropdown__item（限定在当前面板内）
             try:
-                items = self.ctx.locator(".el-select-dropdown__item").all()
+                items = panel.locator(".el-select-dropdown__item").all()
                 for item in items:
                     try:
                         text = item.text_content().strip()
@@ -351,10 +433,10 @@ class FilterHandler:
             except Exception as e:
                 logger.debug("策略1查找选项失败: %s", e)
 
-            # 策略2：通过 span 子元素的文本精确匹配
+            # 策略2：通过 span 子元素的文本精确匹配（限定在当前面板内）
             if not option_found:
                 try:
-                    items = self.ctx.locator(
+                    items = panel.locator(
                         ".el-select-dropdown__item span"
                     ).all()
                     for item in items:
@@ -373,10 +455,10 @@ class FilterHandler:
                 except Exception as e:
                     logger.debug("策略2查找选项失败: %s", e)
 
-            # 策略3：使用 has-text 精确文本匹配（最后手段）
+            # 策略3：使用 has-text 精确文本匹配（限定在当前面板内）
             if not option_found:
                 try:
-                    target = self.ctx.locator(
+                    target = panel.locator(
                         f'.el-select-dropdown__item:has-text("{option_text}")'
                     ).first
                     if target.is_visible():
