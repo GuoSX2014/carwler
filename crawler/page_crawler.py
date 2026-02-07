@@ -51,6 +51,51 @@ class PageCrawler:
 
     # ── iframe 上下文切换 ────────────────────────────────────────
 
+    def _drill_into_nested_iframe(self, frame: Frame) -> Optional[Frame]:
+        """
+        检查 Frame 内是否包含嵌套的 iframe，如果有则进入最内层。
+
+        该平台部分页面使用 3 层 iframe 嵌套：
+        - 主页面 → pxf-settlement-outnetpub iframe → 内层 id="iframe"（FineReport 报表）
+        - 内层 iframe 包含实际的表单控件（日期输入框、查询按钮、数据表格）
+
+        FineReport iframe 特征：
+        - id="iframe"
+        - 包含 .fr-trigger-editor（日期控件）、.fr-form-imgboard（按钮）
+        - 或包含 input, button, table 等通用控件
+
+        Args:
+            frame: 上一层 iframe 的 Frame 对象
+
+        Returns:
+            内层 iframe 的 Frame 对象，如果没有嵌套则返回 None
+        """
+        try:
+            inner_iframes = frame.query_selector_all("iframe")
+            for inner_el in inner_iframes:
+                try:
+                    inner_frame = inner_el.content_frame()
+                    if inner_frame:
+                        # 检查内层 iframe 是否有实际的表单控件
+                        count = inner_frame.locator(
+                            "input, button, table, "
+                            ".fr-trigger-editor, .fr-form-imgboard, "
+                            ".el-date-editor, .el-select, .el-input"
+                        ).count()
+                        if count > 0:
+                            inner_id = inner_el.get_attribute("id") or "unknown"
+                            logger.info(
+                                "发现嵌套内层 iframe: %s (包含 %d 个表单控件, URL: %s)",
+                                inner_id, count,
+                                inner_frame.url[:80] if inner_frame.url else "N/A",
+                            )
+                            return inner_frame
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("检查嵌套 iframe 失败: %s", e)
+        return None
+
     def _get_content_frame(self) -> Optional[Frame]:
         """
         检测当前页面中可见的内容 iframe 并返回其 Frame 对象。
@@ -59,17 +104,16 @@ class PageCrawler:
         - 主页面（self.page）包含侧边栏菜单和 tab 切换
         - 功能页面（日期筛选、表格、导出按钮等）在 iframe 内
 
-        iframe 特征：
-        - class="tabIframe" 或 class="iframeModeTab"
-        - 多个 iframe 共存，只有当前激活的 tab 对应的 iframe 可见
-        - iframe id 类似 pxf-phbsx-other-outer, pxf-common-portal 等
+        平台存在两种 iframe 结构：
+        1. 二层结构：主页面 → 内容 iframe（Element UI 页面，如实时节点边际电价）
+        2. 三层结构：主页面 → 中间 iframe → 内层 iframe（FineReport 报表页面）
+           中间 iframe 通常 id="pxf-settlement-outnetpub"
+           内层 iframe 通常 id="iframe"，包含 FineReport 表单控件
 
-        优先策略：
-        - 如果记录了上次使用的 iframe ID，优先查找该 ID 的 iframe
-        - 避免在重新检测时误切换到其他页面的 iframe
+        本方法会自动检测并穿透嵌套结构，返回最内层包含实际控件的 Frame。
 
         Returns:
-            可见 iframe 的 Frame 对象，未找到返回 None
+            最内层内容 iframe 的 Frame 对象，未找到返回 None
         """
         # 方法0：如果记录了 iframe ID，优先按 ID 查找
         if self._current_iframe_id:
@@ -85,6 +129,10 @@ class PageCrawler:
                             self._current_iframe_id,
                             frame.url[:80] if frame.url else "N/A",
                         )
+                        # ★ 检查是否有嵌套的内层 iframe
+                        inner = self._drill_into_nested_iframe(frame)
+                        if inner:
+                            return inner
                         return frame
             except Exception as e:
                 logger.debug("通过ID查找iframe失败: %s", e)
@@ -105,6 +153,11 @@ class PageCrawler:
                             )
                             # 记住这个 iframe 的 ID
                             self._current_iframe_id = iframe_id
+
+                            # ★ 检查是否有嵌套的内层 iframe（FineReport 三层结构）
+                            inner = self._drill_into_nested_iframe(frame)
+                            if inner:
+                                return inner
                             return frame
                 except Exception:
                     continue
@@ -118,8 +171,11 @@ class PageCrawler:
                     continue
                 try:
                     # 检查 frame 内是否有表单控件或按钮
+                    # 同时支持 Element UI 和 FineReport 控件
                     count = frame.locator(
-                        "button, .el-date-editor, .el-select, .el-input, input, table"
+                        "button, input, table, "
+                        ".el-date-editor, .el-select, .el-input, "
+                        ".fr-trigger-editor, .fr-form-imgboard"
                     ).count()
                     if count > 0:
                         logger.info(
@@ -139,6 +195,9 @@ class PageCrawler:
         """
         检测 iframe 并将所有 handler 的操作上下文切换到 iframe 内。
 
+        包含重试机制：如果首次只找到外层 iframe（内层尚未加载），
+        会等待并重新尝试穿透嵌套 iframe。
+
         如果未检测到 iframe，handler 将继续使用主页面上下文。
         """
         frame = self._get_content_frame()
@@ -148,6 +207,30 @@ class PageCrawler:
             self.extractor.ctx = frame
             self.pagination.ctx = frame
             logger.info("已将操作上下文切换到 iframe")
+
+            # 检查是否可能还有未加载的内层 iframe
+            # 如果当前 frame 没有 FineReport/ElementUI 控件，
+            # 但有一个 iframe 子元素，说明内层可能还在加载
+            try:
+                control_count = frame.locator(
+                    "input, .fr-trigger-editor, .el-date-editor"
+                ).count()
+                inner_iframe_count = len(frame.query_selector_all("iframe"))
+                if control_count == 0 and inner_iframe_count > 0:
+                    logger.info("外层 iframe 中发现内层 iframe 但控件未加载，等待加载...")
+                    for retry in range(5):
+                        time.sleep(2)
+                        inner = self._drill_into_nested_iframe(frame)
+                        if inner:
+                            self.filter_handler.ctx = inner
+                            self.export_handler.ctx = inner
+                            self.extractor.ctx = inner
+                            self.pagination.ctx = inner
+                            logger.info("内层 iframe 加载完成 (第%d次尝试)", retry + 1)
+                            return
+                    logger.warning("内层 iframe 未能在预期时间内加载完成")
+            except Exception as e:
+                logger.debug("检查内层 iframe 加载状态失败: %s", e)
         else:
             # 回退到主页面
             self.filter_handler.ctx = self.page

@@ -92,14 +92,23 @@ class ExportHandler:
         """
         查找导出按钮（在 iframe 内查找）
 
+        适配多种页面类型：
+        - Element UI 页面：标准 <button> 或 <a> 元素
+        - FineReport 报表：<button class="fr-btn-text x-emb-excel"> 元素
+
         Args:
-            export_type: 按钮文本
+            export_type: 按钮文本（如 "原样导出"、"导出"）
 
         Returns:
             按钮元素或 None
         """
         # 按优先级尝试多种选择器
         selectors = [
+            # FineReport 导出按钮
+            f'button.x-emb-excel:has-text("{export_type}")',
+            'button.x-emb-excel',
+            'button.fr-btn-text.x-emb-excel',
+            # Element UI / 标准按钮
             f'button:has-text("{export_type}")',
             f'a:has-text("{export_type}")',
             f'span:has-text("{export_type}")',
@@ -110,11 +119,12 @@ class ExportHandler:
             try:
                 btn = self.ctx.locator(sel).first
                 if btn.is_visible():
+                    logger.debug("找到导出按钮（选择器: %s）", sel)
                     return btn
             except Exception:
                 continue
 
-        # 回退：查找包含"导出"文字的按钮
+        # 回退：查找包含"导出"文字的按钮（含 FineReport 的按钮）
         try:
             btns = self.ctx.locator("button").all()
             for btn in btns:

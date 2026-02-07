@@ -29,6 +29,10 @@ class DataExtractor:
         """
         提取页面中指定序号的表格数据
 
+        支持两种表格类型：
+        - Element UI 页面：标准 HTML table
+        - FineReport 报表：使用 tridx 属性的 table（class="x-table"）
+
         Args:
             table_index: 表格索引（页面可能有多个表格）
 
@@ -46,7 +50,18 @@ class DataExtractor:
             html = self.ctx.content()
             soup = BeautifulSoup(html, "lxml")
 
-            # 查找所有表格
+            # 优先查找 FineReport 数据表格（class 包含 x-table 或 REPORT）
+            fr_tables = soup.find_all("table", class_=re.compile(r"x-table|REPORT"))
+            if fr_tables:
+                # 使用 FineReport 专用解析
+                table = fr_tables[min(table_index, len(fr_tables) - 1)]
+                headers, rows = self._parse_finereport_table(table)
+                if headers:
+                    logger.info("FineReport 表格提取完成: %d 列, %d 行",
+                                len(headers), len(rows))
+                    return headers, rows
+
+            # 回退到标准表格解析
             tables = soup.find_all("table")
             if not tables:
                 logger.warning("页面中未找到表格")
@@ -96,6 +111,60 @@ class DataExtractor:
         except Exception as e:
             logger.error("提取所有表格失败: %s", e)
             return []
+
+    def _parse_finereport_table(self, table) -> Tuple[List[str], List[Dict]]:
+        """
+        解析 FineReport 报表的表格。
+
+        FineReport 表格特征：
+        - table 有 class="x-table" 或包含 "REPORT" 的 class
+        - 使用 tridx 属性标识行（tridx="0" 为表头，tridx="1"+ 为数据行）
+        - 单元格使用 td 而非 th
+        - 数据行可能跳过 tridx（如 tridx=0 是表头，tridx=2 开始是数据）
+
+        Args:
+            table: BeautifulSoup table 元素
+
+        Returns:
+            (表头列表, 数据行字典列表)
+        """
+        headers = []
+        rows = []
+
+        # 找到所有带 tridx 属性的行
+        all_rows = table.find_all("tr", attrs={"tridx": True})
+        if not all_rows:
+            # 如果没有 tridx 属性，回退到标准解析
+            return self._parse_table(table)
+
+        # 按 tridx 排序
+        all_rows.sort(key=lambda r: int(r.get("tridx", 0)))
+
+        # 第一行（tridx 最小）作为表头
+        if all_rows:
+            header_row = all_rows[0]
+            for cell in header_row.find_all(["td", "th"]):
+                text = cell.get_text(strip=True)
+                headers.append(text)
+
+        if not headers:
+            return [], []
+
+        # 其余行作为数据行
+        for tr in all_rows[1:]:
+            cells = tr.find_all(["td", "th"])
+            if not cells:
+                continue
+            row_data = {}
+            for i, cell in enumerate(cells):
+                key = headers[i] if i < len(headers) else f"列{i + 1}"
+                row_data[key] = cell.get_text(strip=True)
+
+            # 过滤掉全空行
+            if any(v for v in row_data.values()):
+                rows.append(row_data)
+
+        return headers, rows
 
     def _parse_table(self, table) -> Tuple[List[str], List[Dict]]:
         """

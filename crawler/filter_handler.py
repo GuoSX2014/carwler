@@ -33,7 +33,8 @@ class FilterHandler:
 
         不同页面可能使用不同的前端框架：
         - Element UI 页面：使用 .el-form-item, .el-date-editor 等类
-        - 其他页面（如抽蓄电站水位）：使用标准 HTML input, button 等
+        - FineReport 报表页面：使用 .fr-trigger-editor, .fr-form-imgboard 等类
+        - 其他页面：使用标准 HTML input, button 等
 
         处理两种异常：
         - PlaywrightTimeout: 超时但 Frame 仍有效，可以继续尝试
@@ -56,7 +57,26 @@ class FilterHandler:
             logger.warning("等待筛选区域时出现异常: %s", e)
             return
 
-        # Element UI 选择器未匹配，尝试通用选择器（适配非 Element UI 页面）
+        # 尝试 FineReport 报表选择器
+        try:
+            self.ctx.wait_for_selector(
+                ".fr-trigger-editor, .fr-form-imgboard, "
+                "input.fr-trigger-texteditor, .para-container",
+                timeout=10000,
+            )
+            logger.debug("通过 FineReport 选择器检测到筛选区域")
+            return
+        except PlaywrightTimeout:
+            pass
+        except Exception as e:
+            err_msg = str(e)
+            if "detached" in err_msg.lower():
+                logger.error("iframe 已 detached，需要重新检测: %s", err_msg)
+                raise
+            logger.warning("等待筛选区域时出现异常: %s", e)
+            return
+
+        # Element UI 和 FineReport 选择器均未匹配，尝试通用选择器
         try:
             self.ctx.wait_for_selector(
                 "input, select, button, form, table",
@@ -64,7 +84,7 @@ class FilterHandler:
             )
             logger.debug("通过通用选择器检测到筛选区域")
         except PlaywrightTimeout:
-            logger.warning("筛选区域未在预期时间出现（Element UI 和通用选择器均未匹配）")
+            logger.warning("筛选区域未在预期时间出现（Element UI、FineReport 和通用选择器均未匹配）")
         except Exception as e:
             err_msg = str(e)
             if "detached" in err_msg.lower():
@@ -116,16 +136,285 @@ class FilterHandler:
                 continue
         return None
 
+    # ── FineReport 页面检测 ──────────────────────────────────────
+
+    def _is_finereport_page(self) -> bool:
+        """
+        检测当前上下文是否为 FineReport 报表页面。
+
+        FineReport 页面特征：
+        - 包含 .fr-trigger-editor（日期/下拉控件）
+        - 包含 .fr-form-imgboard（按钮控件）
+        - 包含 .para-container（参数面板容器）
+        - 包含 [widgetname] 属性的元素
+
+        Returns:
+            True 如果是 FineReport 页面
+        """
+        try:
+            fr_count = self.ctx.locator(
+                ".fr-trigger-editor, .fr-form-imgboard, .para-container"
+            ).count()
+            return fr_count > 0
+        except Exception:
+            return False
+
+    # ── FineReport 下拉框（combo）处理 ───────────────────────────
+
+    def _fr_get_dropdown_options(self, dropdown_label: str) -> List[str]:
+        """
+        获取 FineReport combo 控件的下拉选项。
+
+        FineReport combo 控件使用 widgetname 属性标识，选项可能来自服务器（remote 模式）。
+        优先通过 FineReport JavaScript API 获取，回退到 DOM 操作方式。
+
+        Args:
+            dropdown_label: 下拉框标签/widgetname（如 "节点名称"、"断面名称"）
+
+        Returns:
+            选项文本列表
+        """
+        options = []
+
+        # 方法1：通过 FineReport JS API 获取选项
+        try:
+            result = self.ctx.evaluate("""(widgetName) => {
+                try {
+                    // FineReport 提供 _g() 函数访问报表对象
+                    var form = _g();
+                    if (!form || !form.parameterEl) return [];
+                    var widget = form.parameterEl.getWidgetByName(widgetName);
+                    if (!widget) return [];
+                    // combo 控件提供 getItems() 方法
+                    if (typeof widget.getItems === 'function') {
+                        var items = widget.getItems();
+                        return items.map(function(item) {
+                            return item.text || item.value || '';
+                        }).filter(function(t) { return t; });
+                    }
+                    return [];
+                } catch(e) {
+                    return [];
+                }
+            }""", dropdown_label)
+            if result and len(result) > 0:
+                options = [str(item) for item in result if item]
+                logger.info("通过 FineReport JS API 获取到 %d 个下拉选项", len(options))
+                return options
+        except Exception as e:
+            logger.debug("FineReport JS API 获取下拉选项失败: %s", e)
+
+        # 方法2：通过 DOM 操作（点击打开下拉列表，读取选项）
+        try:
+            # 找到 combo 控件
+            combo = self.ctx.locator(f'div.fr-trigger-editor[widgetname="{dropdown_label}"]').first
+            if not combo or not combo.is_visible():
+                logger.warning("未找到 FineReport combo 控件: %s", dropdown_label)
+                return options
+
+            # 点击触发按钮打开下拉列表
+            trigger_btn = combo.locator(".fr-trigger-btn-up, .fr-trigger-btn").first
+            if trigger_btn and trigger_btn.is_visible():
+                trigger_btn.click()
+            else:
+                combo.locator("input").first.click()
+            time.sleep(1)
+
+            # 等待下拉列表出现并收集选项
+            # FineReport combo 下拉列表的常见选择器
+            fr_dropdown_selectors = [
+                ".fr-combo-list-item",
+                ".fr-trigger-list .fr-trigger-item",
+                ".fr-list-item",
+                ".x-combo-list-item",
+            ]
+
+            for sel in fr_dropdown_selectors:
+                try:
+                    items = self.ctx.locator(sel).all()
+                    if items and len(items) > 0:
+                        for item in items:
+                            text = item.text_content().strip()
+                            if text and text not in options:
+                                options.append(text)
+                        if options:
+                            logger.info("通过 DOM 获取到 %d 个 FineReport 下拉选项", len(options))
+                            break
+                except Exception:
+                    continue
+
+            # 关闭下拉列表
+            try:
+                self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        except Exception as e:
+            logger.debug("FineReport DOM 获取下拉选项失败: %s", e)
+
+        return options
+
+    def _fr_select_dropdown_option(self, dropdown_label: str, option_text: str):
+        """
+        在 FineReport combo 控件中选择指定选项。
+
+        优先通过 FineReport JavaScript API 设置值，回退到 DOM 操作。
+
+        Args:
+            dropdown_label: 下拉框标签/widgetname
+            option_text: 要选择的选项文本
+        """
+        # 方法1：通过 FineReport JS API 设置值
+        try:
+            success = self.ctx.evaluate("""([widgetName, value]) => {
+                try {
+                    var form = _g();
+                    if (!form || !form.parameterEl) return false;
+                    var widget = form.parameterEl.getWidgetByName(widgetName);
+                    if (!widget) return false;
+                    widget.setValue(value);
+                    return true;
+                } catch(e) {
+                    return false;
+                }
+            }""", [dropdown_label, option_text])
+            if success:
+                logger.info("通过 FineReport JS API 设置下拉值: %s = %s",
+                            dropdown_label, option_text)
+                time.sleep(0.5)
+                return
+        except Exception as e:
+            logger.debug("FineReport JS API 设置下拉值失败: %s", e)
+
+        # 方法2：通过 DOM 操作（在输入框中直接输入文本）
+        try:
+            combo_input = self.ctx.locator(
+                f'div.fr-trigger-editor[widgetname="{dropdown_label}"] '
+                f'input.fr-trigger-texteditor'
+            ).first
+            if combo_input and combo_input.is_visible():
+                combo_input.click()
+                time.sleep(0.3)
+                combo_input.fill(option_text)
+                time.sleep(0.5)
+                # 按 Enter 确认选择
+                combo_input.press("Enter")
+                time.sleep(0.3)
+                logger.info("通过 DOM 输入设置下拉值: %s = %s",
+                            dropdown_label, option_text)
+                return
+        except Exception as e:
+            logger.debug("FineReport DOM 输入设置下拉值失败: %s", e)
+
+        # 方法3：通过点击下拉列表中的选项
+        try:
+            # 打开下拉列表
+            combo = self.ctx.locator(f'div.fr-trigger-editor[widgetname="{dropdown_label}"]').first
+            trigger_btn = combo.locator(".fr-trigger-btn-up, .fr-trigger-btn").first
+            if trigger_btn and trigger_btn.is_visible():
+                trigger_btn.click()
+            else:
+                combo.locator("input").first.click()
+            time.sleep(1)
+
+            # 在下拉列表中查找并点击目标选项
+            fr_item_selectors = [
+                ".fr-combo-list-item",
+                ".fr-trigger-list .fr-trigger-item",
+                ".fr-list-item",
+                ".x-combo-list-item",
+            ]
+
+            for sel in fr_item_selectors:
+                try:
+                    items = self.ctx.locator(sel).all()
+                    for item in items:
+                        text = item.text_content().strip()
+                        if text == option_text:
+                            item.click()
+                            time.sleep(0.5)
+                            logger.info("通过点击 FineReport 下拉列表选项: %s = %s",
+                                        dropdown_label, option_text)
+                            return
+                except Exception:
+                    continue
+
+            # 关闭下拉列表
+            try:
+                self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.debug("FineReport DOM 点击选项失败: %s", e)
+
+        raise RuntimeError(f"FineReport 下拉选项设置失败: {dropdown_label} = {option_text}")
+
+    def _fr_set_page_size(self, size: int):
+        """
+        设置 FineReport 报表的每页条数。
+
+        通过 PAGESIZE combo 控件设置，优先使用 JS API。
+
+        Args:
+            size: 每页条数（10/20/30/40/50）
+        """
+        size_str = str(size)
+
+        # 方法1：通过 FineReport JS API
+        try:
+            success = self.ctx.evaluate("""(value) => {
+                try {
+                    var form = _g();
+                    if (!form || !form.parameterEl) return false;
+                    var widget = form.parameterEl.getWidgetByName('PAGESIZE');
+                    if (!widget) return false;
+                    widget.setValue(value);
+                    return true;
+                } catch(e) {
+                    return false;
+                }
+            }""", size_str)
+            if success:
+                logger.info("通过 FineReport JS API 设置每页条数: %d", size)
+                return
+        except Exception as e:
+            logger.debug("FineReport JS API 设置每页条数失败: %s", e)
+
+        # 方法2：通过 DOM 直接修改 PAGESIZE 输入框
+        try:
+            pagesize_input = self.ctx.locator(
+                'div.fr-trigger-editor[widgetname="PAGESIZE"] input.fr-trigger-texteditor, '
+                'div[widgetname="PAGESIZE"] input'
+            ).first
+            if pagesize_input and pagesize_input.is_visible():
+                pagesize_input.click()
+                time.sleep(0.3)
+                pagesize_input.fill(size_str)
+                time.sleep(0.3)
+                pagesize_input.press("Enter")
+                time.sleep(0.5)
+                logger.info("通过 DOM 设置 FineReport 每页条数: %d", size)
+                return
+        except Exception as e:
+            logger.debug("FineReport DOM 设置每页条数失败: %s", e)
+
+        logger.warning("FineReport 每页条数设置失败")
+
     def set_date(self, date_str: str):
         """
         设置日期输入框（格式：YYYY-MM-DD）
 
         适配多种页面类型：
         - Element UI DatePicker 页面（如：实时节点边际电价等）
-        - 普通文本输入框页面（如：抽蓄电站水位等）
+        - FineReport 报表页面（如：抽蓄电站水位、日前备用总量等）
+        - 普通文本输入框页面
 
-        通过多种策略查找日期输入框，优先尝试 Element UI 选择器，
-        回退到通用选择器。
+        FineReport 页面特征：
+        - 日期控件使用 .fr-trigger-editor[widgetname="日期"]
+        - 输入框使用 input.fr-trigger-texteditor
+        - 支持直接文本输入日期（directEdit: true）
 
         Args:
             date_str: 目标日期（YYYY-MM-DD）
@@ -136,22 +425,37 @@ class FilterHandler:
 
             date_input = None
 
-            # 策略1：通过"日期"标签定位其旁边的日期输入框（Element UI）
-            form_item = self._find_form_item("日期")
-            if form_item is not None:
+            # 策略1：FineReport 报表 - 通过 widgetname 属性精确定位
+            if date_input is None:
                 date_input = self._pick_visible_input(
-                    form_item,
+                    self.ctx,
                     [
-                        ".el-date-editor input",
-                        ".el-date-editor .el-input__inner",
-                        'input[placeholder*="日期"]',
-                        'input[placeholder*="date"]',
-                        ".el-input__inner",
-                        "input",
+                        'div.fr-trigger-editor[widgetname="日期"] input.fr-trigger-texteditor',
+                        'div[widgetname="日期"] input.fr-trigger-texteditor',
+                        'div[widgetname="日期"] input',
+                        "input.fr-trigger-texteditor",
                     ],
                 )
+                if date_input is not None:
+                    logger.debug("通过 FineReport widgetname 找到日期输入框")
 
-            # 策略2：全局查找 Element UI 日期控件
+            # 策略2：通过"日期"标签定位其旁边的日期输入框（Element UI）
+            if date_input is None:
+                form_item = self._find_form_item("日期")
+                if form_item is not None:
+                    date_input = self._pick_visible_input(
+                        form_item,
+                        [
+                            ".el-date-editor input",
+                            ".el-date-editor .el-input__inner",
+                            'input[placeholder*="日期"]',
+                            'input[placeholder*="date"]',
+                            ".el-input__inner",
+                            "input",
+                        ],
+                    )
+
+            # 策略3：全局查找 Element UI 日期控件
             if date_input is None:
                 date_input = self._pick_visible_input(
                     self.ctx,
@@ -164,7 +468,7 @@ class FilterHandler:
                     ],
                 )
 
-            # 策略3：通过标签文本查找附近的 input（适配非 Element UI 页面）
+            # 策略4：通过标签文本查找附近的 input（适配非 Element UI 页面）
             if date_input is None:
                 for label_text in ["日期", "运行日期", "查询日期", "选择日期", "日"]:
                     try:
@@ -191,7 +495,7 @@ class FilterHandler:
                     except Exception:
                         continue
 
-            # 策略4：查找值包含日期格式的 input（当前页面已有日期值）
+            # 策略5：查找值包含日期格式的 input（当前页面已有日期值）
             if date_input is None:
                 try:
                     inputs = self.ctx.locator("input").all()
@@ -210,13 +514,25 @@ class FilterHandler:
                     pass
 
             if date_input is None:
+                # 输出调试信息帮助定位问题
+                try:
+                    input_count = self.ctx.locator("input").count()
+                    fr_count = self.ctx.locator(".fr-trigger-editor").count()
+                    el_count = self.ctx.locator(".el-date-editor").count()
+                    logger.error(
+                        "未找到日期输入框 - 页面控件统计: "
+                        "input=%d, fr-trigger-editor=%d, el-date-editor=%d",
+                        input_count, fr_count, el_count,
+                    )
+                except Exception:
+                    pass
                 raise RuntimeError("未找到日期输入框")
 
             # 点击日期输入框
             date_input.click()
             time.sleep(0.5)
 
-            # 全选已有内容，输入新日期
+            # 三次全选已有内容（用 Ctrl+A 和 Meta+A 兼容 macOS/Windows）
             date_input.press("Control+a")
             time.sleep(0.1)
             date_input.fill(date_str)
@@ -238,9 +554,9 @@ class FilterHandler:
             except Exception:
                 pass
 
-            # 按回车确认
+            # 按 Tab 确认输入（FineReport 的日期控件响应 Tab/Enter 事件来确认值）
             try:
-                date_input.press("Enter")
+                date_input.press("Tab")
             except Exception:
                 pass
             time.sleep(0.3)
@@ -430,6 +746,8 @@ class FilterHandler:
         """
         获取指定下拉框的所有选项
 
+        自动检测页面类型（FineReport / Element UI），使用对应的策略。
+
         Args:
             dropdown_label: 下拉框标签（如：节点名称、断面名称、机组名称等）
 
@@ -442,14 +760,20 @@ class FilterHandler:
         try:
             self._wait_for_filters_ready()
 
-            # 打开下拉面板
-            self._open_dropdown_panel(dropdown_label)
+            # 检测页面类型，优先使用 FineReport 路径
+            if self._is_finereport_page():
+                logger.info("检测到 FineReport 页面，使用 FineReport 方式获取下拉选项")
+                options = self._fr_get_dropdown_options(dropdown_label)
+            else:
+                # Element UI 路径
+                # 打开下拉面板
+                self._open_dropdown_panel(dropdown_label)
 
-            # 收集选项
-            options = self._collect_visible_dropdown_items()
+                # 收集选项
+                options = self._collect_visible_dropdown_items()
 
-            # 关闭面板
-            self._close_dropdown_panel()
+                # 关闭面板
+                self._close_dropdown_panel()
 
             logger.info("下拉选项 [%s]: 共 %d 个", dropdown_label, len(options))
             if options:
@@ -459,7 +783,10 @@ class FilterHandler:
 
         except Exception as e:
             logger.error("获取下拉选项失败 [%s]: %s", dropdown_label, e)
-            self._close_dropdown_panel()
+            try:
+                self._close_dropdown_panel()
+            except Exception:
+                pass
 
         return options
 
@@ -467,14 +794,7 @@ class FilterHandler:
         """
         选择下拉框中的指定选项。
 
-        流程：
-        1. 打开下拉面板
-        2. 在当前可见面板中找到目标选项
-        3. 滚动到可见区域并点击
-        4. 等待面板关闭
-        5. 验证选择结果
-
-        关键：必须只在当前打开的面板中查找，避免误点击其他面板的选项。
+        自动检测页面类型（FineReport / Element UI），使用对应的策略。
 
         Args:
             dropdown_label: 下拉框标签
@@ -484,101 +804,138 @@ class FilterHandler:
         try:
             self._wait_for_filters_ready()
 
-            # 打开下拉面板
-            self._open_dropdown_panel(dropdown_label)
-            time.sleep(0.3)
+            # 检测页面类型
+            if self._is_finereport_page():
+                logger.info("检测到 FineReport 页面，使用 FineReport 方式选择下拉选项")
+                self._fr_select_dropdown_option(dropdown_label, option_text)
+                logger.info("已选择: %s = %s", dropdown_label, option_text)
+                return
 
-            # 关键：找到当前打开的面板，仅在其中查找选项
-            panel = self._find_active_dropdown_panel()
-            if panel is None:
-                self._close_dropdown_panel()
-                raise RuntimeError(
-                    f"下拉面板未打开，无法选择选项: {option_text}"
-                )
+            # Element UI 路径
+            self._el_select_dropdown_option(dropdown_label, option_text)
 
-            # 在面板中查找目标选项并点击
-            option_found = False
-
-            # 策略1：精确匹配 el-select-dropdown__item（限定在当前面板内）
+        except Exception as e:
+            logger.error("选择下拉选项失败 [%s=%s]: %s", dropdown_label, option_text, e)
             try:
-                items = panel.locator(".el-select-dropdown__item").all()
+                self._close_dropdown_panel()
+            except Exception:
+                pass
+            raise
+
+    def _el_select_dropdown_option(self, dropdown_label: str, option_text: str):
+        """
+        Element UI 页面的下拉选项选择逻辑。
+
+        流程：
+        1. 打开下拉面板
+        2. 在当前可见面板中找到目标选项
+        3. 滚动到可见区域并点击
+        4. 等待面板关闭
+
+        关键：必须只在当前打开的面板中查找，避免误点击其他面板的选项。
+
+        Args:
+            dropdown_label: 下拉框标签
+            option_text: 要选择的选项文本
+        """
+        # 打开下拉面板
+        self._open_dropdown_panel(dropdown_label)
+        time.sleep(0.3)
+
+        # 关键：找到当前打开的面板，仅在其中查找选项
+        panel = self._find_active_dropdown_panel()
+        if panel is None:
+            self._close_dropdown_panel()
+            raise RuntimeError(
+                f"下拉面板未打开，无法选择选项: {option_text}"
+            )
+
+        # 在面板中查找目标选项并点击
+        option_found = False
+
+        # 策略1：精确匹配 el-select-dropdown__item（限定在当前面板内）
+        try:
+            items = panel.locator(".el-select-dropdown__item").all()
+            for item in items:
+                try:
+                    text = item.text_content().strip()
+                    if text == option_text:
+                        # 滚动到可见区域
+                        item.scroll_into_view_if_needed()
+                        time.sleep(0.2)
+                        item.click()
+                        option_found = True
+                        logger.debug("通过精确匹配点击选项: %s", option_text)
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("策略1查找选项失败: %s", e)
+
+        # 策略2：通过 span 子元素的文本精确匹配（限定在当前面板内）
+        if not option_found:
+            try:
+                items = panel.locator(
+                    ".el-select-dropdown__item span"
+                ).all()
                 for item in items:
                     try:
                         text = item.text_content().strip()
                         if text == option_text:
-                            # 滚动到可见区域
-                            item.scroll_into_view_if_needed()
+                            parent = item.locator("..")
+                            parent.scroll_into_view_if_needed()
                             time.sleep(0.2)
-                            item.click()
+                            parent.click()
                             option_found = True
-                            logger.debug("通过精确匹配点击选项: %s", option_text)
+                            logger.debug("通过span子元素点击选项: %s", option_text)
                             break
                     except Exception:
                         continue
             except Exception as e:
-                logger.debug("策略1查找选项失败: %s", e)
+                logger.debug("策略2查找选项失败: %s", e)
 
-            # 策略2：通过 span 子元素的文本精确匹配（限定在当前面板内）
-            if not option_found:
-                try:
-                    items = panel.locator(
-                        ".el-select-dropdown__item span"
-                    ).all()
-                    for item in items:
-                        try:
-                            text = item.text_content().strip()
-                            if text == option_text:
-                                parent = item.locator("..")
-                                parent.scroll_into_view_if_needed()
-                                time.sleep(0.2)
-                                parent.click()
-                                option_found = True
-                                logger.debug("通过span子元素点击选项: %s", option_text)
-                                break
-                        except Exception:
-                            continue
-                except Exception as e:
-                    logger.debug("策略2查找选项失败: %s", e)
+        # 策略3：使用 has-text 精确文本匹配（限定在当前面板内）
+        if not option_found:
+            try:
+                target = panel.locator(
+                    f'.el-select-dropdown__item:has-text("{option_text}")'
+                ).first
+                if target.is_visible():
+                    target.scroll_into_view_if_needed()
+                    time.sleep(0.2)
+                    target.click()
+                    option_found = True
+                    logger.debug("通过has-text点击选项: %s", option_text)
+            except Exception as e:
+                logger.debug("策略3查找选项失败: %s", e)
 
-            # 策略3：使用 has-text 精确文本匹配（限定在当前面板内）
-            if not option_found:
-                try:
-                    target = panel.locator(
-                        f'.el-select-dropdown__item:has-text("{option_text}")'
-                    ).first
-                    if target.is_visible():
-                        target.scroll_into_view_if_needed()
-                        time.sleep(0.2)
-                        target.click()
-                        option_found = True
-                        logger.debug("通过has-text点击选项: %s", option_text)
-                except Exception as e:
-                    logger.debug("策略3查找选项失败: %s", e)
-
-            if not option_found:
-                self._close_dropdown_panel()
-                raise RuntimeError(f"未在下拉选项中找到: {option_text}")
-
-            # 等待下拉面板自动关闭（el-select 选中后自动收起）
-            time.sleep(0.5)
-
-            logger.info("已选择: %s = %s", dropdown_label, option_text)
-
-        except Exception as e:
-            logger.error("选择下拉选项失败 [%s=%s]: %s", dropdown_label, option_text, e)
+        if not option_found:
             self._close_dropdown_panel()
-            raise
+            raise RuntimeError(f"未在下拉选项中找到: {option_text}")
+
+        # 等待下拉面板自动关闭（el-select 选中后自动收起）
+        time.sleep(0.5)
+
+        logger.info("已选择: %s = %s", dropdown_label, option_text)
 
     def set_page_size(self, size: int = 50):
         """
         设置每页显示条数
+
+        自动检测页面类型（FineReport / Element UI），使用对应的策略。
 
         Args:
             size: 每页条数（10/20/30/40/50）
         """
         logger.info("设置每页条数: %d", size)
         try:
-            # 查找每页条数下拉框
+            # 优先检查是否为 FineReport 页面
+            if self._is_finereport_page():
+                logger.info("检测到 FineReport 页面，使用 FineReport 方式设置每页条数")
+                self._fr_set_page_size(size)
+                return
+
+            # Element UI 路径
             page_size_selectors = [
                 "text=每页条数",
                 "text=每页展示",
@@ -619,12 +976,25 @@ class FilterHandler:
             logger.error("设置每页条数失败: %s", e)
 
     def click_query_button(self):
-        """点击「查询」按钮"""
+        """
+        点击「查询」按钮
+
+        适配多种页面类型：
+        - Element UI 页面：<button> 元素
+        - FineReport 报表：<div widgetname="SEARCH"> 元素，内含 <span>查询</span>
+        """
         logger.info("点击「查询」按钮")
         try:
             query_selectors = [
+                # FineReport 查询按钮
+                # widgetname 属性以 "SEARCH" 开头（实际有 SEARCH, SEARCH_C, SEARCH_C_C 等变体）
+                'div[widgetname^="SEARCH"]',
+                'div.fr-form-imgboard:has-text("查询")',
+                'div.fr-form-imgboard:has-text("查 询")',
+                # Element UI 查询按钮
                 'button:has-text("查询")',
                 'button:has-text("查 询")',
+                # 通用匹配
                 "text=查询",
                 ".query-btn",
                 'button[type="primary"]',
@@ -640,7 +1010,7 @@ class FilterHandler:
                             self.ctx.wait_for_load_state("networkidle", timeout=15000)
                         except Exception:
                             pass
-                        logger.info("查询已执行")
+                        logger.info("查询已执行（选择器: %s）", sel)
                         return
                 except Exception:
                     continue
