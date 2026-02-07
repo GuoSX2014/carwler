@@ -127,6 +127,63 @@ class PageCrawler:
             self.extractor.ctx = self.page
             self.pagination.ctx = self.page
 
+    def _is_frame_valid(self) -> bool:
+        """
+        检查当前 iframe 上下文是否仍然有效（未被 detach）。
+
+        iframe 可能因页面重新渲染、Vue 路由切换等原因被替换，
+        此时旧的 Frame 引用变为 detached 状态，所有操作都会失败。
+
+        Returns:
+            True 表示 Frame 仍有效，False 表示已 detached
+        """
+        ctx = self.filter_handler.ctx
+        # 如果 ctx 就是 page 本身，不需要检查
+        if ctx == self.page:
+            return True
+        try:
+            # 尝试一个轻量操作来验证 Frame 是否仍然有效
+            ctx.evaluate("() => document.readyState")
+            return True
+        except Exception:
+            return False
+
+    def _ensure_content_frame(self):
+        """
+        确保 iframe 上下文有效。如果 Frame 已 detached，则重新检测 iframe。
+
+        该平台的 Vue.js 应用在页面切换或异步加载时，可能会替换 iframe 元素，
+        导致之前获取的 Frame 引用失效。此方法在关键操作前调用，
+        确保操作上下文始终指向有效的 iframe。
+        """
+        if self._is_frame_valid():
+            return
+
+        logger.warning("检测到 iframe 已 detached，正在重新检测...")
+
+        # 等待一小段时间让页面稳定
+        time.sleep(1)
+
+        # 重试多次，因为新的 iframe 可能还在加载中
+        for attempt in range(5):
+            frame = self._get_content_frame()
+            if frame:
+                self.filter_handler.ctx = frame
+                self.export_handler.ctx = frame
+                self.extractor.ctx = frame
+                self.pagination.ctx = frame
+                logger.info("已重新检测到 iframe 并切换上下文 (第%d次尝试)", attempt + 1)
+                return
+            logger.debug("第%d次重新检测 iframe 未找到，等待后重试...", attempt + 1)
+            time.sleep(2)
+
+        # 最终回退到主页面
+        logger.warning("多次重试仍未检测到 iframe，回退到主页面上下文")
+        self.filter_handler.ctx = self.page
+        self.export_handler.ctx = self.page
+        self.extractor.ctx = self.page
+        self.pagination.ctx = self.page
+
     # ── 主流程 ────────────────────────────────────────────────────
 
     def crawl_task(self, task_name: str, task_config: dict,
@@ -173,8 +230,11 @@ class PageCrawler:
         # ★ 关键步骤：导航完成后，检测 iframe 并切换上下文
         self._switch_to_content_frame()
 
-        # 等待内容区完全加载
-        time.sleep(2)
+        # 等待内容区完全加载（iframe 内容可能需要较长时间）
+        time.sleep(3)
+
+        # ★ 二次确认：iframe 可能在加载过程中被替换，需要重新检测
+        self._ensure_content_frame()
 
         # 设置每页条数（如果支持）
         if has_page_size:
@@ -183,9 +243,10 @@ class PageCrawler:
             except Exception:
                 logger.warning("设置每页条数失败，使用默认值")
 
-        # 获取下拉选项
+        # 获取下拉选项（先确保 iframe 上下文有效）
         dropdown_options = []
         if has_dropdown:
+            self._ensure_content_frame()
             dropdown_options = self.filter_handler.get_dropdown_options(dropdown_label)
             if not dropdown_options:
                 logger.warning("未获取到「%s」的下拉选项，尝试不选择直接查询",
@@ -248,10 +309,13 @@ class PageCrawler:
         """
         执行单次爬取（一个日期 + 一个下拉选项组合）
 
-        支持自动重试
+        支持自动重试，重试前会重新检测 iframe 上下文
         """
         for attempt in range(1, self.retry_times + 1):
             try:
+                # ★ 每次尝试前确保 iframe 上下文有效
+                self._ensure_content_frame()
+
                 self._do_crawl_single(
                     task_name, task_config, date_str, category,
                     dropdown_label, dropdown_value,

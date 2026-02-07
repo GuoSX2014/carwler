@@ -28,7 +28,13 @@ class FilterHandler:
         self.config = config
 
     def _wait_for_filters_ready(self):
-        """等待筛选区域渲染完成"""
+        """
+        等待筛选区域渲染完成。
+
+        处理两种异常：
+        - PlaywrightTimeout: 超时但 Frame 仍有效，可以继续尝试
+        - 其他异常（如 Frame was detached）: Frame 失效，需要抛出让上层重试
+        """
         try:
             self.ctx.wait_for_selector(
                 ".el-form-item, .el-date-editor, .el-select, .el-input",
@@ -36,6 +42,12 @@ class FilterHandler:
             )
         except PlaywrightTimeout:
             logger.warning("筛选区域未在预期时间出现")
+        except Exception as e:
+            err_msg = str(e)
+            if "detached" in err_msg.lower():
+                logger.error("iframe 已 detached，需要重新检测: %s", err_msg)
+                raise  # 向上层抛出，触发 _ensure_content_frame 重新检测
+            logger.warning("等待筛选区域时出现异常: %s", e)
 
     def _find_form_item(self, label: str):
         """根据标签文本查找对应的表单项容器"""
