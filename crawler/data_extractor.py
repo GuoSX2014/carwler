@@ -1,13 +1,15 @@
 """
 数据提取模块
 从 HTML 表格中提取结构化数据
+
+注意：表格在 iframe 内部，需要通过 self.ctx 指向正确的 Frame 上下文。
 """
 
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page, Frame, TimeoutError as PlaywrightTimeout
 from bs4 import BeautifulSoup
 
 from utils.logger import get_logger
@@ -20,6 +22,8 @@ class DataExtractor:
 
     def __init__(self, page: Page):
         self.page = page
+        # ctx 指向实际操作 DOM 的上下文（Frame 或 Page）
+        self.ctx: Union[Page, Frame] = page
 
     def extract_table(self, table_index: int = 0) -> Tuple[List[str], List[Dict]]:
         """
@@ -34,12 +38,12 @@ class DataExtractor:
         logger.info("正在提取表格数据 (表格索引: %d)...", table_index)
 
         try:
-            # 等待表格出现
-            self.page.wait_for_selector("table", timeout=10000)
+            # 等待表格出现（在 iframe 内）
+            self.ctx.wait_for_selector("table", timeout=10000)
             time.sleep(1)
 
-            # 获取页面 HTML
-            html = self.page.content()
+            # 获取内容 HTML（从 iframe 上下文获取）
+            html = self.ctx.content()
             soup = BeautifulSoup(html, "lxml")
 
             # 查找所有表格
@@ -76,7 +80,7 @@ class DataExtractor:
             [(表头列表, 数据行列表), ...]
         """
         try:
-            html = self.page.content()
+            html = self.ctx.content()
             soup = BeautifulSoup(html, "lxml")
             tables = soup.find_all("table")
 
@@ -166,7 +170,7 @@ class DataExtractor:
 
             for sel in selectors:
                 try:
-                    el = self.page.locator(sel).first
+                    el = self.ctx.locator(sel).first
                     if el.is_visible():
                         text = el.text_content().strip()
                         # 提取日期时间
@@ -196,7 +200,7 @@ class DataExtractor:
             (表头列表, 数据行字典列表)
         """
         try:
-            result = self.page.evaluate("""
+            result = self.ctx.evaluate("""
                 () => {
                     const table = document.querySelector('table');
                     if (!table) return { headers: [], rows: [] };

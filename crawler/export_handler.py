@@ -1,14 +1,17 @@
 """
 导出处理模块
 处理「原样导出」和「导出」按钮的点击和文件下载
+
+注意：导出按钮在 iframe 内，需要通过 self.ctx 操作。
+下载事件仍然需要通过 self.page（主页面）来监听。
 """
 
 import os
 import time
 import glob as glob_module
-from typing import Optional
+from typing import Optional, Union
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page, Frame, TimeoutError as PlaywrightTimeout
 
 from utils.logger import get_logger
 
@@ -20,6 +23,8 @@ class ExportHandler:
 
     def __init__(self, page: Page, config: dict):
         self.page = page
+        # ctx 指向实际操作 DOM 的上下文（Frame 或 Page）
+        self.ctx: Union[Page, Frame] = page
         self.config = config
         self.download_dir = os.path.abspath(
             config.get("browser", {}).get("download_dir", "./data/exports")
@@ -44,7 +49,7 @@ class ExportHandler:
         logger.info("尝试导出: %s [%s]", export_type, task_name)
 
         try:
-            # 查找导出按钮
+            # 查找导出按钮（在 iframe 内）
             export_btn = self._find_export_button(export_type)
             if export_btn is None:
                 logger.warning("未找到「%s」按钮", export_type)
@@ -53,7 +58,7 @@ class ExportHandler:
             # 记录下载前的文件列表
             before_files = set(os.listdir(self.download_dir))
 
-            # 使用 Playwright 的下载事件处理
+            # 使用 Playwright 的下载事件处理（download 事件在主 Page 上）
             with self.page.expect_download(timeout=30000) as download_info:
                 export_btn.click()
 
@@ -85,7 +90,7 @@ class ExportHandler:
 
     def _find_export_button(self, export_type: str):
         """
-        查找导出按钮
+        查找导出按钮（在 iframe 内查找）
 
         Args:
             export_type: 按钮文本
@@ -103,7 +108,7 @@ class ExportHandler:
 
         for sel in selectors:
             try:
-                btn = self.page.locator(sel).first
+                btn = self.ctx.locator(sel).first
                 if btn.is_visible():
                     return btn
             except Exception:
@@ -111,7 +116,7 @@ class ExportHandler:
 
         # 回退：查找包含"导出"文字的按钮
         try:
-            btns = self.page.locator("button").all()
+            btns = self.ctx.locator("button").all()
             for btn in btns:
                 text = btn.text_content().strip()
                 if export_type in text or "导出" in text:

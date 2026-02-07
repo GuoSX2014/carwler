@@ -1,13 +1,18 @@
 """
 页面爬取模块
 针对不同页面类型的具体爬取逻辑
+
+关键设计：
+    该平台的页面内容（日期输入框、下拉框、查询/导出按钮、数据表格等）
+    都渲染在 iframe 内部，而不是主页面中。
+    导航后需检测 iframe 并切换到其 Frame 上下文，否则无法找到任何控件。
 """
 
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from playwright.sync_api import Page
+from playwright.sync_api import Page, Frame
 
 from crawler.navigator import Navigator
 from crawler.filter_handler import FilterHandler
@@ -40,6 +45,89 @@ class PageCrawler:
         self.date_interval = config.get("request", {}).get("date_interval", 2)
         self.retry_times = config.get("request", {}).get("retry_times", 3)
         self.retry_interval = config.get("request", {}).get("retry_interval", 5)
+
+    # ── iframe 上下文切换 ────────────────────────────────────────
+
+    def _get_content_frame(self) -> Optional[Frame]:
+        """
+        检测当前页面中可见的内容 iframe 并返回其 Frame 对象。
+
+        该平台使用 iframe 加载各个功能页面内容：
+        - 主页面（self.page）包含侧边栏菜单和 tab 切换
+        - 功能页面（日期筛选、表格、导出按钮等）在 iframe 内
+
+        iframe 特征：
+        - class="tabIframe" 或 class="iframeModeTab"
+        - 多个 iframe 共存，只有当前激活的 tab 对应的 iframe 可见
+        - iframe id 类似 pxf-phbsx-other-outer, pxf-common-portal 等
+
+        Returns:
+            可见 iframe 的 Frame 对象，未找到返回 None
+        """
+        # 方法1：通过 query_selector 找到可见的 iframe 元素
+        try:
+            iframes = self.page.query_selector_all("iframe")
+            for iframe_el in iframes:
+                try:
+                    if iframe_el.is_visible():
+                        frame = iframe_el.content_frame()
+                        if frame:
+                            logger.info(
+                                "找到内容区 iframe: %s (URL: %s)",
+                                iframe_el.get_attribute("id") or "unknown",
+                                frame.url[:80] if frame.url else "N/A",
+                            )
+                            return frame
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("方法1查找iframe失败: %s", e)
+
+        # 方法2：遍历所有 frames，找到有实际内容的非主 frame
+        try:
+            for frame in self.page.frames:
+                if frame == self.page.main_frame:
+                    continue
+                try:
+                    # 检查 frame 内是否有表单控件或按钮
+                    count = frame.locator(
+                        "button, .el-date-editor, .el-select, .el-input, input, table"
+                    ).count()
+                    if count > 0:
+                        logger.info(
+                            "找到内容区 frame (方法2): %s",
+                            frame.url[:80] if frame.url else "N/A",
+                        )
+                        return frame
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("方法2查找iframe失败: %s", e)
+
+        logger.warning("未检测到内容区 iframe，将使用主页面上下文")
+        return None
+
+    def _switch_to_content_frame(self):
+        """
+        检测 iframe 并将所有 handler 的操作上下文切换到 iframe 内。
+
+        如果未检测到 iframe，handler 将继续使用主页面上下文。
+        """
+        frame = self._get_content_frame()
+        if frame:
+            self.filter_handler.ctx = frame
+            self.export_handler.ctx = frame
+            self.extractor.ctx = frame
+            self.pagination.ctx = frame
+            logger.info("已将操作上下文切换到 iframe")
+        else:
+            # 回退到主页面
+            self.filter_handler.ctx = self.page
+            self.export_handler.ctx = self.page
+            self.extractor.ctx = self.page
+            self.pagination.ctx = self.page
+
+    # ── 主流程 ────────────────────────────────────────────────────
 
     def crawl_task(self, task_name: str, task_config: dict,
                     start_date: str, end_date: str):
@@ -81,6 +169,12 @@ class PageCrawler:
         except Exception as e:
             logger.error("导航到「%s」失败: %s", task_name, e)
             return
+
+        # ★ 关键步骤：导航完成后，检测 iframe 并切换上下文
+        self._switch_to_content_frame()
+
+        # 等待内容区完全加载
+        time.sleep(2)
 
         # 设置每页条数（如果支持）
         if has_page_size:

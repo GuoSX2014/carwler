@@ -1,12 +1,14 @@
 """
 分页处理模块
 处理表格的分页控件和滚动加载
+
+注意：分页控件在 iframe 内部，需要通过 self.ctx 指向正确的 Frame 上下文。
 """
 
 import time
-from typing import Optional
+from typing import Optional, Union
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Page, Frame, TimeoutError as PlaywrightTimeout
 
 from utils.logger import get_logger
 
@@ -18,6 +20,8 @@ class PaginationHandler:
 
     def __init__(self, page: Page, config: dict):
         self.page = page
+        # ctx 指向实际操作 DOM 的上下文（Frame 或 Page）
+        self.ctx: Union[Page, Frame] = page
         self.config = config
         self.page_interval = config.get("request", {}).get("page_interval", 2)
 
@@ -38,7 +42,7 @@ class PaginationHandler:
 
             for sel in pager_selectors:
                 try:
-                    el = self.page.locator(sel).first
+                    el = self.ctx.locator(sel).first
                     if el.is_visible():
                         text = el.text_content().strip()
                         # 提取数字
@@ -51,7 +55,7 @@ class PaginationHandler:
 
             # 方式2：查找页码输入框旁边的总页数
             try:
-                total_text = self.page.locator('text=/\\/\\s*\\d+/').first
+                total_text = self.ctx.locator('text=/\\/\\s*\\d+/').first
                 if total_text.is_visible():
                     text = total_text.text_content()
                     import re
@@ -85,7 +89,7 @@ class PaginationHandler:
 
             for sel in next_selectors:
                 try:
-                    btn = self.page.locator(sel).first
+                    btn = self.ctx.locator(sel).first
                     if btn.is_visible():
                         # 检查按钮是否禁用
                         disabled = btn.get_attribute("disabled")
@@ -121,13 +125,16 @@ class PaginationHandler:
 
             for sel in next_selectors:
                 try:
-                    btn = self.page.locator(sel).first
+                    btn = self.ctx.locator(sel).first
                     if btn.is_visible() and btn.is_enabled():
                         btn.click()
                         time.sleep(self.page_interval)
-                        self.page.wait_for_load_state(
-                            "networkidle", timeout=10000
-                        )
+                        try:
+                            self.ctx.wait_for_load_state(
+                                "networkidle", timeout=10000
+                            )
+                        except Exception:
+                            pass
                         logger.debug("已翻到下一页")
                         return True
                 except Exception:
@@ -160,15 +167,18 @@ class PaginationHandler:
 
             for sel in page_input_selectors:
                 try:
-                    inp = self.page.locator(sel).first
+                    inp = self.ctx.locator(sel).first
                     if inp.is_visible():
                         inp.click()
                         inp.fill(str(page_num))
                         inp.press("Enter")
                         time.sleep(self.page_interval)
-                        self.page.wait_for_load_state(
-                            "networkidle", timeout=10000
-                        )
+                        try:
+                            self.ctx.wait_for_load_state(
+                                "networkidle", timeout=10000
+                            )
+                        except Exception:
+                            pass
                         logger.debug("已跳转到第 %d 页", page_num)
                         return True
                 except Exception:
@@ -197,8 +207,8 @@ class PaginationHandler:
 
         while attempts < max_attempts:
             try:
-                # 获取当前滚动高度
-                current_height = self.page.evaluate(f"""
+                # 获取当前滚动高度（在 iframe 内执行）
+                current_height = self.ctx.evaluate(f"""
                     () => {{
                         const el = document.querySelector('{scroll_target}');
                         if (el) {{
