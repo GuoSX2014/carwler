@@ -180,6 +180,95 @@ class FilterHandler:
             logger.error("设置日期失败 [%s]: %s", date_str, e)
             raise
 
+    def _open_dropdown_panel(self, dropdown_label: str):
+        """
+        打开指定标签的下拉框面板，并等待面板出现。
+
+        Element UI 的 el-select 下拉面板是独立 DOM 节点，
+        挂载在 <body> 上（不在 el-select 内部），需要通过
+        可见性检查来定位当前打开的面板。
+
+        Args:
+            dropdown_label: 下拉框标签
+
+        Returns:
+            下拉输入框 Locator
+
+        Raises:
+            RuntimeError: 未找到下拉框
+        """
+        dropdown = self._find_dropdown(dropdown_label)
+        if dropdown is None:
+            raise RuntimeError(f"未找到下拉框: {dropdown_label}")
+
+        # 先关闭可能已打开的面板
+        try:
+            self.page.keyboard.press("Escape")
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+        # 点击打开下拉面板
+        dropdown.click()
+        time.sleep(0.8)
+
+        # 等待下拉面板出现（el-select-dropdown 是挂载在 body 上的独立 DOM）
+        try:
+            self.ctx.wait_for_selector(
+                ".el-select-dropdown__item",
+                state="visible",
+                timeout=5000,
+            )
+        except PlaywrightTimeout:
+            # 可能首次点击未生效，再试一次
+            logger.debug("下拉面板未出现，重试点击...")
+            dropdown.click()
+            time.sleep(1)
+            try:
+                self.ctx.wait_for_selector(
+                    ".el-select-dropdown__item",
+                    state="visible",
+                    timeout=5000,
+                )
+            except PlaywrightTimeout:
+                logger.warning("下拉面板仍未出现")
+
+        return dropdown
+
+    def _close_dropdown_panel(self):
+        """关闭当前打开的下拉面板"""
+        try:
+            self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+    def _collect_visible_dropdown_items(self) -> List[str]:
+        """
+        从当前打开的下拉面板中收集所有选项文本。
+
+        Element UI 的 el-select 下拉面板可能包含可滚动列表，
+        但所有选项 DOM 节点都存在（非虚拟滚动），可以一次性获取。
+
+        Returns:
+            选项文本列表
+        """
+        options = []
+        try:
+            items = self.ctx.locator(
+                ".el-select-dropdown__item span, .el-select-dropdown__item"
+            ).all()
+            for item in items:
+                try:
+                    text = item.text_content().strip()
+                    if text and text != "全部" and text not in options:
+                        options.append(text)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("收集下拉选项失败: %s", e)
+        return options
+
     def get_dropdown_options(self, dropdown_label: str) -> List[str]:
         """
         获取指定下拉框的所有选项
@@ -196,65 +285,37 @@ class FilterHandler:
         try:
             self._wait_for_filters_ready()
 
-            # 定位下拉框
-            dropdown = self._find_dropdown(dropdown_label)
-            if dropdown is None:
-                logger.warning("未找到下拉框: %s", dropdown_label)
-                return options
+            # 打开下拉面板
+            self._open_dropdown_panel(dropdown_label)
 
-            # 点击展开下拉框
-            dropdown.click()
-            time.sleep(1)
+            # 收集选项
+            options = self._collect_visible_dropdown_items()
 
-            # 等待下拉选项出现
-            try:
-                self.ctx.wait_for_selector(
-                    ".el-select-dropdown__item",
-                    timeout=5000,
-                )
-            except PlaywrightTimeout:
-                logger.debug("等待下拉选项超时，继续尝试获取")
-
-            # 获取下拉选项列表
-            option_selectors = [
-                ".el-select-dropdown__item",
-                "li.el-select-dropdown__item",
-                ".el-dropdown-menu__item",
-            ]
-
-            for sel in option_selectors:
-                try:
-                    items = self.ctx.locator(sel).all()
-                    if items:
-                        for item in items:
-                            try:
-                                text = item.text_content().strip()
-                                if text and text != "全部":
-                                    options.append(text)
-                            except Exception:
-                                continue
-                        if options:
-                            break
-                except Exception:
-                    continue
-
-            # 关闭下拉框
-            try:
-                self.page.keyboard.press("Escape")
-            except Exception:
-                pass
-            time.sleep(0.5)
+            # 关闭面板
+            self._close_dropdown_panel()
 
             logger.info("下拉选项 [%s]: 共 %d 个", dropdown_label, len(options))
+            if options:
+                logger.info("  前5个: %s%s",
+                            options[:5],
+                            " ..." if len(options) > 5 else "")
 
         except Exception as e:
             logger.error("获取下拉选项失败 [%s]: %s", dropdown_label, e)
+            self._close_dropdown_panel()
 
         return options
 
     def select_dropdown_option(self, dropdown_label: str, option_text: str):
         """
-        选择下拉框中的指定选项
+        选择下拉框中的指定选项。
+
+        流程：
+        1. 打开下拉面板
+        2. 在面板中找到目标选项
+        3. 滚动到可见区域并点击
+        4. 等待面板关闭
+        5. 验证选择结果
 
         Args:
             dropdown_label: 下拉框标签
@@ -264,52 +325,81 @@ class FilterHandler:
         try:
             self._wait_for_filters_ready()
 
-            dropdown = self._find_dropdown(dropdown_label)
-            if dropdown is None:
-                logger.warning("未找到下拉框: %s", dropdown_label)
-                return
+            # 打开下拉面板
+            self._open_dropdown_panel(dropdown_label)
+            time.sleep(0.3)
 
-            dropdown.click()
-            time.sleep(1)
-
-            # 等待下拉选项出现
-            try:
-                self.ctx.wait_for_selector(
-                    ".el-select-dropdown__item",
-                    timeout=5000,
-                )
-            except PlaywrightTimeout:
-                pass
-
-            # 在下拉列表中查找并点击目标选项
+            # 在面板中查找目标选项并点击
             option_found = False
-            option_selectors = [
-                ".el-select-dropdown__item",
-                "li.el-select-dropdown__item",
-            ]
 
-            for sel in option_selectors:
-                try:
-                    items = self.ctx.locator(sel).all()
-                    for item in items:
-                        if item.text_content().strip() == option_text:
+            # 策略1：精确匹配 el-select-dropdown__item
+            try:
+                items = self.ctx.locator(".el-select-dropdown__item").all()
+                for item in items:
+                    try:
+                        text = item.text_content().strip()
+                        if text == option_text:
+                            # 滚动到可见区域
+                            item.scroll_into_view_if_needed()
+                            time.sleep(0.2)
                             item.click()
                             option_found = True
+                            logger.debug("通过精确匹配点击选项: %s", option_text)
                             break
-                    if option_found:
-                        break
-                except Exception:
-                    continue
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.debug("策略1查找选项失败: %s", e)
+
+            # 策略2：通过 span 子元素的文本精确匹配
+            if not option_found:
+                try:
+                    items = self.ctx.locator(
+                        ".el-select-dropdown__item span"
+                    ).all()
+                    for item in items:
+                        try:
+                            text = item.text_content().strip()
+                            if text == option_text:
+                                parent = item.locator("..")
+                                parent.scroll_into_view_if_needed()
+                                time.sleep(0.2)
+                                parent.click()
+                                option_found = True
+                                logger.debug("通过span子元素点击选项: %s", option_text)
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.debug("策略2查找选项失败: %s", e)
+
+            # 策略3：使用 has-text 精确文本匹配（最后手段）
+            if not option_found:
+                try:
+                    target = self.ctx.locator(
+                        f'.el-select-dropdown__item:has-text("{option_text}")'
+                    ).first
+                    if target.is_visible():
+                        target.scroll_into_view_if_needed()
+                        time.sleep(0.2)
+                        target.click()
+                        option_found = True
+                        logger.debug("通过has-text点击选项: %s", option_text)
+                except Exception as e:
+                    logger.debug("策略3查找选项失败: %s", e)
 
             if not option_found:
-                # 尝试直接通过文本点击
-                self.ctx.locator(f"text={option_text}").first.click()
+                self._close_dropdown_panel()
+                raise RuntimeError(f"未在下拉选项中找到: {option_text}")
 
+            # 等待下拉面板自动关闭（el-select 选中后自动收起）
             time.sleep(0.5)
-            logger.info("已选择: %s", option_text)
+
+            logger.info("已选择: %s = %s", dropdown_label, option_text)
 
         except Exception as e:
             logger.error("选择下拉选项失败 [%s=%s]: %s", dropdown_label, option_text, e)
+            self._close_dropdown_panel()
             raise
 
     def set_page_size(self, size: int = 50):
@@ -396,18 +486,36 @@ class FilterHandler:
 
     def _find_dropdown(self, label: str):
         """
-        根据标签文本查找对应的下拉框元素
+        根据标签文本查找对应的下拉框输入元素。
+
+        Element UI el-select 的典型 DOM 结构：
+          <div class="el-form-item">
+            <label>节点名称</label>
+            <div class="el-form-item__content">
+              <div class="el-select">
+                <div class="el-input">
+                  <input class="el-input__inner" placeholder="请选择">
+                  <span class="el-input__suffix">
+                    <i class="el-select__caret el-input__icon el-icon-arrow-up"></i>
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        点击 .el-input__inner 或 .el-select 容器都可以打开下拉面板。
 
         Args:
             label: 标签文本
 
         Returns:
-            下拉框元素（Locator）或 None
+            下拉框输入元素（Locator）或 None
         """
+        # 策略1：通过表单项容器查找
         try:
-            # 策略1：表单项容器内查找
             form_item = self._find_form_item(label)
             if form_item is not None:
+                # 优先找 el-select 的 input
                 dropdown = self._pick_visible_input(
                     form_item,
                     [
@@ -419,12 +527,37 @@ class FilterHandler:
                     ],
                 )
                 if dropdown is not None:
+                    logger.debug("通过表单项容器找到下拉框: %s", label)
                     return dropdown
         except Exception:
             pass
 
+        # 策略2：通过标签文本 + 紧邻的 el-select 查找
         try:
-            # 策略2：直接查找 aria-label 或 placeholder
+            label_el = self.ctx.locator(f"text={label}").first
+            if label_el.is_visible():
+                # 向上找父级容器，在其中寻找 el-select
+                for level in range(1, 5):
+                    ancestor = label_el
+                    for _ in range(level):
+                        ancestor = ancestor.locator("..")
+                    try:
+                        select_input = ancestor.locator(
+                            ".el-select .el-input__inner"
+                        ).first
+                        if select_input.is_visible():
+                            logger.debug(
+                                "通过标签祖先(level=%d)找到下拉框: %s",
+                                level, label,
+                            )
+                            return select_input
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # 策略3：直接查找 placeholder / aria-label 匹配的输入框
+        try:
             selectors = [
                 f'[aria-label*="{label}"]',
                 f'[placeholder*="{label}"]',
@@ -433,12 +566,13 @@ class FilterHandler:
             for sel in selectors:
                 el = self.ctx.locator(sel).first
                 if el.is_visible():
+                    logger.debug("通过属性选择器找到下拉框: %s", label)
                     return el
         except Exception:
             pass
 
+        # 策略4：通过标签文本找到相邻的 input
         try:
-            # 策略3：通过标签文本找到旁边的 input
             label_el = self.ctx.locator(f"text={label}").first
             if label_el.is_visible():
                 parent = label_el.locator("..")
@@ -446,8 +580,10 @@ class FilterHandler:
                     "select, .el-select .el-input__inner, .el-input__inner"
                 ).first
                 if dropdown.is_visible():
+                    logger.debug("通过标签直接父级找到下拉框: %s", label)
                     return dropdown
         except Exception:
             pass
 
+        logger.warning("所有策略均未找到下拉框: %s", label)
         return None

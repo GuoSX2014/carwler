@@ -278,10 +278,12 @@ class PageCrawler:
 
         # 1. 设置日期
         self.filter_handler.set_date(date_str)
+        time.sleep(0.5)
 
-        # 2. 设置下拉选项
+        # 2. 设置下拉选项（先选下拉，再点查询）
         if dropdown_label and dropdown_value:
             self.filter_handler.select_dropdown_option(dropdown_label, dropdown_value)
+            time.sleep(0.5)
 
         # 3. 点击查询
         self.filter_handler.click_query_button()
