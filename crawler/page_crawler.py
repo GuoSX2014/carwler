@@ -82,6 +82,16 @@ class PageCrawler:
             logger.error("导航到「%s」失败: %s", task_name, e)
             return
 
+        # 等待查询区域（日期、节点名称等筛选控件）加载完成
+        try:
+            self.page.wait_for_selector(
+                ".el-form-item, .el-date-editor, [class*='query'], button:has-text('查询')",
+                timeout=10000,
+            )
+            time.sleep(1)
+        except Exception:
+            pass
+
         # 设置每页条数（如果支持）
         if has_page_size:
             try:

@@ -24,48 +24,55 @@ class FilterHandler:
         """
         设置日期输入框（格式：YYYY-MM-DD）
 
-        通过清空并重新输入日期值，适配大多数日期选择器
+        页面使用 Element UI 的 el-date-editor，日期标签「日期」与输入框在同一 el-form-item 内。
+        通过定位包含「日期」的表单项再取 input，避免误匹配或结构差异导致定位失败。
 
         Args:
-            date_str: 目标日期（YYYY-MM-DD）
+            date_str: 目标日期，必须为 YYYY-MM-DD 格式（如 2025-06-01）
         """
         logger.info("设置日期: %s", date_str)
         try:
-            # 尝试定位日期输入框 - 多种可能的选择器
-            date_selectors = [
-                'input[placeholder*="日期"]',
-                'input[placeholder*="date"]',
-                'input[type="date"]',
-                '.el-date-editor input',
-                'input.el-input__inner',
-            ]
-
-            date_input = None
-            for selector in date_selectors:
-                try:
-                    # 寻找日期标签旁边的输入框
-                    candidate = self.page.locator(selector).first
-                    if candidate.is_visible():
-                        date_input = candidate
-                        break
-                except Exception:
-                    continue
-
-            if date_input is None:
-                # 回退方案：通过"日期"标签定位
-                label = self.page.locator("text=日期").first
-                date_input = label.locator(".. >> input").first
-
-            # 清空并输入新日期
-            date_input.click()
+            # 等待查询区域加载（日期控件在筛选表单内）
+            self.page.wait_for_selector(".el-form-item, .el-date-editor, [class*='query']", timeout=10000)
             time.sleep(0.5)
 
-            # 全选并删除现有内容
+            date_input = None
+
+            # 优先：Element UI 表单项 - 包含「日期」文字的那一项内的 input
+            try:
+                form_item = self.page.locator(".el-form-item").filter(has_text="日期").first
+                candidate = form_item.locator(".el-date-editor input, input").first
+                if candidate.is_visible(timeout=3000):
+                    date_input = candidate
+            except Exception:
+                pass
+
+            if date_input is None:
+                for selector in [
+                    'input[placeholder*="日期"]',
+                    'input[placeholder*="date"]',
+                    'input[type="date"]',
+                    '.el-date-editor input',
+                ]:
+                    try:
+                        candidate = self.page.locator(selector).first
+                        if candidate.is_visible(timeout=2000):
+                            date_input = candidate
+                            break
+                    except Exception:
+                        continue
+
+            if date_input is None:
+                # 最后回退：通过「日期」标签找父级再找 input（可能结构不同）
+                label = self.page.locator("text=日期").first
+                date_input = label.locator("xpath=ancestor::*[.//input][1]//input").first
+
+            # 点击聚焦后清空并输入，严格使用 YYYY-MM-DD
+            date_input.click(timeout=10000)
+            time.sleep(0.5)
             date_input.press("Control+a")
             date_input.fill(date_str)
             time.sleep(0.3)
-
-            # 按回车确认
             date_input.press("Enter")
             time.sleep(0.5)
 
@@ -77,7 +84,10 @@ class FilterHandler:
 
     def get_dropdown_options(self, dropdown_label: str) -> List[str]:
         """
-        获取指定下拉框的所有选项
+        获取指定下拉框的所有选项。
+
+        节点名称等下拉框选项可能由接口请求加载，需先点击/聚焦触发请求，
+        再等待下拉列表出现后采集选项。
 
         Args:
             dropdown_label: 下拉框标签（如：节点名称、断面名称、机组名称等）
@@ -89,17 +99,26 @@ class FilterHandler:
         options = []
 
         try:
-            # 定位下拉框
             dropdown = self._find_dropdown(dropdown_label)
             if dropdown is None:
                 logger.warning("未找到下拉框: %s", dropdown_label)
                 return options
 
-            # 点击展开下拉框
-            dropdown.click()
+            # 点击展开，触发可能存在的异步加载（如节点名称）
+            dropdown.click(timeout=10000)
+            time.sleep(0.5)
+
+            # 等待下拉列表出现（选项可能由请求加载后渲染）
+            try:
+                self.page.wait_for_selector(
+                    ".el-select-dropdown__item, .el-select-dropdown .el-select-dropdown__list",
+                    state="visible",
+                    timeout=10000,
+                )
+            except Exception:
+                pass
             time.sleep(1)
 
-            # 获取下拉选项列表
             option_selectors = [
                 ".el-select-dropdown__item",
                 ".el-dropdown-menu__item",
@@ -112,14 +131,13 @@ class FilterHandler:
                     items = self.page.locator(sel).all()
                     if items:
                         for item in items:
-                            text = item.text_content().strip()
+                            text = (item.text_content() or "").strip()
                             if text and text != "全部":
                                 options.append(text)
                         break
                 except Exception:
                     continue
 
-            # 关闭下拉框（点击空白处）
             self.page.keyboard.press("Escape")
             time.sleep(0.5)
 
@@ -132,7 +150,9 @@ class FilterHandler:
 
     def select_dropdown_option(self, dropdown_label: str, option_text: str):
         """
-        选择下拉框中的指定选项
+        选择下拉框中的指定选项。
+
+        节点名称等选项可能需先点击触发加载，再等待列表出现后点击目标项。
 
         Args:
             dropdown_label: 下拉框标签
@@ -145,20 +165,25 @@ class FilterHandler:
                 logger.warning("未找到下拉框: %s", dropdown_label)
                 return
 
-            dropdown.click()
-            time.sleep(1)
+            dropdown.click(timeout=10000)
+            time.sleep(0.5)
 
-            # 在下拉列表中查找并点击目标选项
+            # 等待下拉列表出现（异步加载的选项）
+            try:
+                self.page.wait_for_selector(
+                    ".el-select-dropdown__item",
+                    state="visible",
+                    timeout=10000,
+                )
+            except Exception:
+                pass
+            time.sleep(0.5)
+
             option_found = False
-            option_selectors = [
-                ".el-select-dropdown__item",
-                "li.el-select-dropdown__item",
-            ]
-
-            for sel in option_selectors:
+            for sel in [".el-select-dropdown__item", "li.el-select-dropdown__item"]:
                 items = self.page.locator(sel).all()
                 for item in items:
-                    if item.text_content().strip() == option_text:
+                    if (item.text_content() or "").strip() == option_text:
                         item.click()
                         option_found = True
                         break
@@ -166,7 +191,6 @@ class FilterHandler:
                     break
 
             if not option_found:
-                # 尝试直接通过文本点击
                 self.page.locator(f"text={option_text}").first.click()
 
             time.sleep(0.5)
@@ -257,38 +281,50 @@ class FilterHandler:
 
     def _find_dropdown(self, label: str):
         """
-        根据标签文本查找对应的下拉框元素
+        根据标签文本查找对应的下拉框元素。
+
+        节点名称等为 el-select，标签「节点名称」与控件在同一 el-form-item 内，
+        选项可能需点击后才通过请求加载。
 
         Args:
-            label: 标签文本
+            label: 标签文本（如：节点名称、断面名称）
 
         Returns:
             下拉框元素（Locator）或 None
         """
         try:
-            # 策略1：label 旁边的 select/input
+            # 策略1：Element UI 表单项 - 包含该标签的那一项内的 .el-select 或 input
+            form_item = self.page.locator(".el-form-item").filter(has_text=label).first
+            dropdown = form_item.locator(
+                ".el-select .el-input__inner, .el-input__inner, select"
+            ).first
+            if dropdown.is_visible(timeout=3000):
+                return dropdown
+        except Exception:
+            pass
+
+        try:
+            # 策略2：标签旁边的 select/input
             label_el = self.page.locator(f"text={label}").first
-            if label_el.is_visible():
-                # 尝试找同级或相邻的下拉框
+            if label_el.is_visible(timeout=3000):
                 parent = label_el.locator("..")
                 dropdown = parent.locator(
                     "select, .el-select .el-input__inner, .el-input__inner"
                 ).first
-                if dropdown.is_visible():
+                if dropdown.is_visible(timeout=2000):
                     return dropdown
         except Exception:
             pass
 
         try:
-            # 策略2：直接查找 aria-label 或 placeholder
-            selectors = [
-                f'[aria-label*="{label}"]',
+            # 策略3：placeholder / aria-label
+            for sel in [
                 f'[placeholder*="{label}"]',
+                f'[aria-label*="{label}"]',
                 f'select[name*="{label}"]',
-            ]
-            for sel in selectors:
+            ]:
                 el = self.page.locator(sel).first
-                if el.is_visible():
+                if el.is_visible(timeout=2000):
                     return el
         except Exception:
             pass
